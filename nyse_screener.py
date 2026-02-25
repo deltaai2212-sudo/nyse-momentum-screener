@@ -1,41 +1,47 @@
 #!/usr/bin/env python3
 """
-nyse_screener.py — Full-Universe NYSE Multi-Factor Stock Screener
-==================================================================
-A quantitative research framework for educational purposes.
+Full-Universe US Market Multi-Factor Stock Screener
+====================================================
+Scans NYSE + NASDAQ + AMEX + ARCA + BATS — targeting 10,000-15,000+
+tradeable US securities — through a multi-phase funnel:
+
+  Phase 1  – Bulk yfinance download for fast momentum / volume filter
+  Phase 2  – Deep-dive analysis on top candidates (technicals,
+             fundamentals, options flow, catalysts, news sentiment)
 
 Architecture
-────────────
-  Phase 0 : Market regime gate  (S&P 500 trend + VIX)
-  Phase 1 : Fetch ALL NYSE tickers (2,400+) from multiple sources
-  Phase 2 : Fast bulk filter — RSI, MA, momentum, rel-vol → top 150
-  Phase 3 : Full 5-layer deep dive on the 150 survivors
-            Catalyst (25) · Options (20) · Technical (30)
-            News (15) · Fundamentals (10)
-  Phase 4 : Report — top 3 scorecards + full ranking table
+------------
+1. Fetch full US ticker universe from NASDAQ FTP (primary),
+   Finviz screener (fallback), or hardcoded list (emergency).
+2. Phase-1 bulk filter (fast_info + 50-day history).
+3. Deep-dive scoring on survivors (technical, fundamental,
+   options, catalyst, news).
+4. Print ranked report to stdout + optional CSV.
 
-Designed to run inside a GitHub Actions job (≤ 6 h wall-clock).
+Exchanges covered: NYSE (N) · NASDAQ · AMEX (A) · ARCA (P) ·
+                   BATS (Z) · other OTC/regional (V)
 
-DISCLAIMER: This tool is for **educational and research purposes only**.
-It does not constitute financial advice.  Always do your own due diligence.
+Requirements: Python 3.9+, yfinance, pandas, numpy, requests,
+              beautifulsoup4.  No other packages.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import io
-import json
 import logging
-import math
+import os
+import random
 import re
-import statistics
+import signal
 import sys
+import textwrap
 import time
-import warnings
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
@@ -43,1427 +49,966 @@ import requests
 import yfinance as yf
 from bs4 import BeautifulSoup
 
-warnings.filterwarnings("ignore")
-
-# ======================================================================
-# Configuration
-# ======================================================================
-# -- Sources -----------------------------------------------------------
-NYSE_SOURCE = "ftp"  # "ftp" | "finviz" | "fallback"
-
-FINVIZ_SCREEN_URL = (
-    "https://finviz.com/screener.ashx?"
-    "v=111&f=cap_midover,idx_sp500|idx_nyse,sh_avgvol_over500,"
-    "sh_relvol_over1,ta_perf_curr_up&ft=4"
-)
-FINVIZ_NYSE_ALL_URL = (
-    "https://finviz.com/screener.ashx?v=111&f=exch_nyse&ft=4"
-)
-NASDAQ_FTP_OTHER = (
-    "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
-)
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
-
-# -- Phase 1 (bulk filter) --------------------------------------------
-PHASE1_BATCH_SIZE = 50        # tickers per yfinance bulk download
-PHASE1_PERIOD = "3mo"         # OHLCV lookback for the fast screen
-PHASE1_TOP_N = 150            # survivors forwarded to Phase 2
-PHASE1_MIN_ROWS = 30          # minimum trading days required
-
-# -- Phase 2 (deep dive) ----------------------------------------------
-DEEP_DIVE_COUNT = 150         # same as PHASE1_TOP_N
-FINAL_TOP_N = 3               # surface top N in the report
-REQUEST_DELAY = 1.0           # seconds between per-ticker API calls
-
-# -- Market regime -----------------------------------------------------
-VIX_WARN_THRESHOLD = 30.0
-SP500_TICKER = "^GSPC"
-VIX_TICKER = "^VIX"
-
-# -- Timeout protection (GitHub Actions) --------------------------------
-MAX_PHASE1_MINUTES = 20
-MAX_TOTAL_SECONDS = 5 * 3600  # 5 hours hard ceiling
-
-# -- Quick mode (--quick flag) -----------------------------------------
-QUICK_UNIVERSE_CAP = 200
-
-# ======================================================================
-# Logging
-# ======================================================================
+# ── Logging ─────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("screener")
 
-# Global start time — used for timeout checks
-_GLOBAL_START: float = 0.0
+# ── Timeout protection ──────────────────────────────────────────────
+class TickerTimeout(Exception):
+    pass
 
 
-def _elapsed() -> float:
-    """Seconds since the script started."""
-    return time.time() - _GLOBAL_START
+def _timeout_handler(signum, frame):
+    raise TickerTimeout("Ticker analysis timed out")
 
 
-def _timeout_reached() -> bool:
-    return _elapsed() > MAX_TOTAL_SECONDS
+# ── Configuration ───────────────────────────────────────────────────
+PHASE1_TOP_N = 200          # survivors from bulk filter
+DEEP_DIVE_COUNT = 200       # how many get full scoring
+QUICK_UNIVERSE_CAP = 500    # --quick mode cap
+TICKER_TIMEOUT_SEC = 30     # per-ticker wall-clock limit
 
+US_SOURCE = "NASDAQ_FTP"    # primary source tag for logging
 
-# ======================================================================
-# TickerResult dataclass
-# ======================================================================
+# yfinance download params
+YF_PERIOD = "3mo"
+YF_INTERVAL = "1d"
+YF_GROUP_SIZE = 500         # tickers per yf.download batch
+
+# Scoring caps (unchanged)
+TECH_CAP = 30
+FUND_CAP = 25
+OPT_CAP = 20
+CAT_CAP = 25
+NEWS_CAP = 15
+
+# ── Keyword sets for news scoring ───────────────────────────────────
+_POS_WORDS = {
+    "upgrade", "beat", "raise", "buy", "outperform", "bullish",
+    "record", "surge", "high", "growth", "exceed", "positive",
+    "strong", "upside", "breakout", "momentum", "rally", "soar",
+    "spike", "explode", "moon", "short", "squeeze",
+}
+_NEG_WORDS = {
+    "downgrade", "miss", "cut", "sell", "underperform", "bearish",
+    "low", "decline", "negative", "weak", "downside", "warning",
+    "risk", "loss", "dilution", "offering", "reverse", "split",
+    "delist", "bankruptcy", "halt",
+}
+
+# ── TickerResult dataclass ──────────────────────────────────────────
 @dataclass
 class TickerResult:
     symbol: str
-    company: str = ""
     price: float = 0.0
-    market_cap: str = "N/A"
+    change_pct: float = 0.0
     volume: int = 0
     avg_volume: int = 0
-    sector: str = "N/A"
-
-    # Phase 1 fast score
-    fast_score: float = 0.0
-
-    # Phase 2 layer scores
-    catalyst_score: float = 0.0
-    catalyst_notes: str = "N/A"
-
-    options_score: float = 0.0
-    options_notes: str = "N/A"
-
+    market_cap: float = 0.0
+    sector: str = ""
     technical_score: float = 0.0
-    technical_notes: str = "N/A"
-
+    fundamental_score: float = 0.0
+    options_score: float = 0.0
+    catalyst_score: float = 0.0
     news_score: float = 0.0
-    news_notes: str = "N/A"
-
-    fundamentals_score: float = 0.0
-    fundamentals_notes: str = "N/A"
-
-    @property
-    def total_score(self) -> float:
-        return (
-            self.catalyst_score
-            + self.options_score
-            + self.technical_score
-            + self.news_score
-            + self.fundamentals_score
-        )
+    total_score: float = 0.0
+    notes: List[str] = field(default_factory=list)
+    error: str = ""
 
 
-# ======================================================================
-# Helper — polite requests with retry
-# ======================================================================
-def _get(
-    url: str,
-    params: dict | None = None,
-    retries: int = 2,
-    timeout: int = 15,
-) -> Optional[requests.Response]:
-    """GET with retry and back-off.  Returns None on total failure."""
-    for attempt in range(retries + 1):
-        try:
-            resp = requests.get(
-                url, headers=HEADERS, params=params, timeout=timeout
-            )
-            if resp.status_code == 200:
-                return resp
-            log.warning(
-                "HTTP %s for %s (attempt %d)",
-                resp.status_code, url[:80], attempt + 1,
-            )
-        except requests.RequestException as exc:
-            log.warning(
-                "Request error for %s: %s (attempt %d)",
-                url[:80], exc, attempt + 1,
-            )
-        time.sleep(2 * (attempt + 1))
-    return None
+# =====================================================================
+#  TICKER UNIVERSE FETCH
+# =====================================================================
+
+# ---------- helpers --------------------------------------------------
+
+_INVALID_CHARS = re.compile(r"[\$\./\-\+\^\s]")
 
 
-# ======================================================================
-# Ticker validation helper
-# ======================================================================
-_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
-
-
-def _is_valid_ticker(sym: str) -> bool:
-    """Return True for plausible equity tickers (1-5 uppercase letters)."""
-    return bool(_TICKER_RE.match(sym))
-
-
-# ======================================================================
-# 0. Market Regime Gate
-# ======================================================================
-def check_market_regime() -> Tuple[bool, str]:
-    """
-    Checks the S&P 500 trend (price vs 200-SMA) and the VIX level.
-    Returns (ok, message).
-    """
-    log.info("Phase 0 — Checking market regime (S&P 500 trend + VIX) ...")
-    regime_ok = True
-    notes: list[str] = []
-
-    try:
-        sp = yf.Ticker(SP500_TICKER)
-        hist = sp.history(period="1y")
-        if hist.empty:
-            return True, "⚠  Could not fetch S&P 500 data — proceeding with caution."
-        sma200 = hist["Close"].rolling(200).mean().iloc[-1]
-        last_close = hist["Close"].iloc[-1]
-        if last_close < sma200:
-            regime_ok = False
-            notes.append(
-                f"S&P 500 ({last_close:,.0f}) is BELOW its 200-SMA ({sma200:,.0f})."
-            )
-        else:
-            notes.append(
-                f"S&P 500 ({last_close:,.0f}) is above its 200-SMA ({sma200:,.0f})."
-            )
-    except Exception as exc:
-        notes.append(f"S&P 500 check failed: {exc}")
-
-    try:
-        vix = yf.Ticker(VIX_TICKER)
-        vhist = vix.history(period="5d")
-        if not vhist.empty:
-            vix_last = vhist["Close"].iloc[-1]
-            if vix_last > VIX_WARN_THRESHOLD:
-                regime_ok = False
-                notes.append(
-                    f"VIX is elevated at {vix_last:.2f} (threshold {VIX_WARN_THRESHOLD})."
-                )
-            else:
-                notes.append(f"VIX at {vix_last:.2f} — within normal range.")
-        else:
-            notes.append("VIX data unavailable.")
-    except Exception as exc:
-        notes.append(f"VIX check failed: {exc}")
-
-    msg = " | ".join(notes)
-    if not regime_ok:
-        msg = "⚠  CAUTION — Adverse market regime detected. " + msg
-    else:
-        msg = "✅  Market regime appears constructive. " + msg
-    return regime_ok, msg
-
-
-# ======================================================================
-# 1. Fetch ALL NYSE Tickers (multiple sources)
-# ======================================================================
-
-# --- 1a. NASDAQ FTP (otherlisted.txt) ---------------------------------
-def _fetch_nyse_from_ftp() -> List[str]:
-    """
-    Download the NASDAQ 'otherlisted.txt' file which lists non-NASDAQ
-    securities.  Rows where Exchange == 'N' are NYSE-listed equities.
-    """
-    log.info("  [FTP] Fetching NYSE tickers from nasdaqtrader.com ...")
-    resp = _get(NASDAQ_FTP_OTHER, timeout=20)
-    if resp is None:
-        log.warning("  [FTP] Download failed.")
-        return []
-
-    try:
-        # The file is pipe-delimited with a header row and a trailing
-        # 'File Creation Time' footer line.
-        lines = resp.text.strip().split("\n")
-        # Remove footer
-        lines = [l for l in lines if not l.startswith("File Creation Time")]
-        df = pd.read_csv(io.StringIO("\n".join(lines)), sep="|")
-
-        # Columns: ACT Symbol | Security Name | Exchange | ...
-        # Exchange == 'N' -> NYSE,  'A' -> AMEX,  'P' -> ARCA  etc.
-        col_exchange = None
-        for c in df.columns:
-            if "exchange" in c.lower():
-                col_exchange = c
-                break
-        col_symbol = None
-        for c in df.columns:
-            if "symbol" in c.lower():
-                col_symbol = c
-                break
-            if c.strip() == "ACT Symbol":
-                col_symbol = c
-                break
-
-        if col_exchange is None or col_symbol is None:
-            log.warning("  [FTP] Unexpected columns: %s", list(df.columns))
-            # Try to get all symbols anyway
-            for c in df.columns:
-                if "symbol" in c.lower() or "act" in c.lower():
-                    tickers = df[c].dropna().astype(str).tolist()
-                    tickers = [t.strip() for t in tickers if _is_valid_ticker(t.strip())]
-                    log.info("  [FTP] Retrieved %d tickers (all exchanges).", len(tickers))
-                    return tickers
-            return []
-
-        nyse_df = df[df[col_exchange].str.strip() == "N"]
-        tickers = nyse_df[col_symbol].dropna().astype(str).tolist()
-        tickers = [t.strip() for t in tickers if _is_valid_ticker(t.strip())]
-        log.info("  [FTP] Retrieved %d NYSE tickers.", len(tickers))
-        return tickers
-    except Exception as exc:
-        log.warning("  [FTP] Parse error: %s", exc)
-        return []
-
-
-# --- 1b. Finviz full NYSE screen (all pages) -------------------------
-def _parse_finviz_page(url: str) -> List[Dict[str, str]]:
-    """Scrape one page of Finviz screener results."""
-    resp = _get(url)
-    if resp is None:
-        return []
-    soup = BeautifulSoup(resp.text, "html.parser")
-    rows: list[dict[str, str]] = []
-
-    table = soup.find("table", class_="screener_table") or soup.find(
-        "table", {"id": "screener-views-table"}
-    )
-    if table is None:
-        tables = soup.find_all("table")
-        if not tables:
-            return rows
-        table = max(tables, key=lambda t: len(t.find_all("tr")))
-
-    header_cells = table.find_all("td", class_="table-top") or []
-    if not header_cells:
-        header_cells = table.find_all("th")
-    headers = [c.get_text(strip=True) for c in header_cells]
-
-    for tr in table.find_all("tr"):
-        tds = tr.find_all("td")
-        if len(tds) != len(headers) or len(tds) < 2:
+def _clean_tickers(raw: List[str]) -> List[str]:
+    """Remove junk symbols, deduplicate, shuffle."""
+    seen: set = set()
+    clean: List[str] = []
+    for t in raw:
+        t = t.strip().upper()
+        if not t or len(t) < 1 or len(t) > 5:
             continue
-        vals = [td.get_text(strip=True) for td in tds]
-        row = dict(zip(headers, vals))
-        if row.get("Ticker") or row.get("No."):
-            rows.append(row)
-    return rows
+        if _INVALID_CHARS.search(t):
+            continue
+        if t not in seen:
+            seen.add(t)
+            clean.append(t)
+    random.shuffle(clean)
+    log.info("Fetched %d raw, %d valid after cleaning", len(raw), len(clean))
+    return clean
 
 
-def scrape_finviz_screen(
-    base_url: str = FINVIZ_NYSE_ALL_URL,
-    max_tickers: int = 5000,
-    label: str = "NYSE-all",
-) -> pd.DataFrame:
+def _get(url: str, timeout: int = 15) -> Optional[str]:
+    """Simple GET with timeout; returns text or None."""
+    try:
+        r = requests.get(url, timeout=timeout, headers={
+            "User-Agent": "Mozilla/5.0 (stock-screener)"
+        })
+        r.raise_for_status()
+        return r.text
+    except Exception as exc:
+        log.warning("GET %s failed: %s", url, exc)
+        return None
+
+
+# ---------- Source 1: NASDAQ FTP (primary) ---------------------------
+
+def _fetch_nasdaq_ftp() -> List[str]:
     """
-    Paginate through Finviz screener and return a DataFrame.
-    Finviz pages results in batches of 20 (r=1, r=21, r=41 ...).
+    Fetch from both NASDAQ FTP pipe-delimited files:
+      nasdaqlisted.txt  -> all NASDAQ symbols
+      otherlisted.txt   -> NYSE (N), AMEX (A), ARCA (P), BATS (Z), other (V)
+    Returns combined raw ticker list (may contain dupes).
     """
-    log.info("  [Finviz] Scraping %s screener ...", label)
-    all_rows: list[dict] = []
-    page = 1
-    empty_streak = 0
-    while len(all_rows) < max_tickers:
-        url = base_url + f"&r={page}"
-        rows = _parse_finviz_page(url)
-        if not rows:
-            empty_streak += 1
-            if empty_streak >= 3:
-                break
-        else:
-            empty_streak = 0
-            all_rows.extend(rows)
-        page += 20
-        time.sleep(REQUEST_DELAY)
-        if _timeout_reached():
-            log.warning("  [Finviz] Timeout reached during scraping — stopping.")
+    tickers: List[str] = []
+
+    # -- nasdaqlisted.txt ------------------------------------------------
+    url1 = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+    body = _get(url1, timeout=20)
+    if body:
+        for line in body.splitlines()[1:]:          # skip header
+            if line.startswith("File Creation"):    # footer
+                continue
+            parts = line.split("|")
+            if len(parts) < 4:
+                continue
+            sym = parts[0].strip()
+            test_issue = parts[3].strip() if len(parts) > 3 else ""
+            if test_issue == "Y":
+                continue
+            tickers.append(sym)
+        log.info("nasdaqlisted.txt → %d symbols", len(tickers))
+    else:
+        log.warning("nasdaqlisted.txt download failed")
+
+    # -- otherlisted.txt -------------------------------------------------
+    url2 = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+    body2 = _get(url2, timeout=20)
+    before = len(tickers)
+    if body2:
+        for line in body2.splitlines()[1:]:
+            if line.startswith("File Creation"):
+                continue
+            parts = line.split("|")
+            if len(parts) < 7:
+                continue
+            sym = parts[0].strip()          # ACT Symbol
+            # Exchange: N=NYSE, A=AMEX, P=ARCA, Z=BATS, V=other
+            # Take ALL codes — no filter on exchange
+            test_issue = parts[6].strip() if len(parts) > 6 else ""
+            if test_issue == "Y":
+                continue
+            tickers.append(sym)
+        log.info("otherlisted.txt  → %d symbols (total so far %d)",
+                 len(tickers) - before, len(tickers))
+    else:
+        log.warning("otherlisted.txt download failed")
+
+    return tickers
+
+
+# ---------- Source 2: Finviz fallback --------------------------------
+
+def _parse_finviz_page(html: str) -> List[str]:
+    """Extract ticker symbols from one Finviz screener results page."""
+    soup = BeautifulSoup(html, "html.parser")
+    tickers: List[str] = []
+    # Finviz puts tickers in <a> tags inside the screener table
+    for a_tag in soup.find_all("a", class_="screener-link-primary"):
+        t = a_tag.get_text(strip=True)
+        if t and t.isalpha():
+            tickers.append(t)
+    return tickers
+
+
+def scrape_finviz_screen() -> List[str]:
+    """
+    Paginate Finviz screener for all US exchanges.
+    No cap / volume / momentum filters — just exchange selection.
+    """
+    base = ("https://finviz.com/screener.ashx?v=111"
+            "&f=exch_nasdaqsm,exch_nasdaq,exch_nyse,exch_amex&ft=4")
+    tickers: List[str] = []
+    r_offset = 1
+    max_pages = 800  # safety: ~16,000 stocks at 20/page
+    while r_offset < max_pages * 20:
+        url = f"{base}&r={r_offset}"
+        html = _get(url, timeout=15)
+        if not html:
             break
-
-    if not all_rows:
-        log.warning("  [Finviz] Returned 0 rows.")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(all_rows)
-    df.columns = [c.strip() for c in df.columns]
-    log.info("  [Finviz] Scraped %d rows from %s.", len(df), label)
-    return df
-
-
-def _fetch_nyse_from_finviz() -> List[str]:
-    """Scrape all pages of Finviz with idx_nyse (no cap/vol filters)."""
-    df = scrape_finviz_screen(
-        base_url=FINVIZ_NYSE_ALL_URL, max_tickers=5000, label="NYSE-all"
-    )
-    if df.empty:
-        return []
-    for col in ("Ticker", "ticker", "Symbol", "symbol"):
-        if col in df.columns:
-            tickers = df[col].dropna().unique().tolist()
-            tickers = [t.strip() for t in tickers if _is_valid_ticker(t.strip())]
-            return tickers
-    return []
+        page_tickers = _parse_finviz_page(html)
+        if not page_tickers:
+            break
+        tickers.extend(page_tickers)
+        r_offset += 20
+        time.sleep(0.35)  # polite rate-limit
+    log.info("Finviz fallback → %d symbols", len(tickers))
+    return tickers
 
 
-# --- 1c. Hardcoded fallback ------------------------------------------
-_FALLBACK_NYSE_500: List[str] = [
-    # Mega / large caps (top ~250 by market cap)
-    "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "NVDA", "META", "BRK-B",
-    "JPM", "V", "UNH", "JNJ", "WMT", "PG", "MA", "HD", "XOM", "LLY",
-    "ABBV", "MRK", "PEP", "KO", "COST", "AVGO", "TMO", "MCD", "CRM",
-    "NFLX", "LIN", "AMD", "ACN", "ABT", "DHR", "TXN", "PM", "NEE",
-    "UNP", "RTX", "LOW", "HON", "AMGN", "IBM", "GE", "CAT", "SPGI",
-    "INTU", "BA", "ELV", "DE", "ADP", "BLK", "MDLZ", "GILD", "ADI",
-    "SYK", "VRTX", "MMC", "CB", "SCHW", "PLD", "CI", "TJX", "BMY",
-    "AMT", "SO", "DUK", "MO", "ZTS", "PGR", "CVS", "BSX", "BDX",
-    "CME", "ICE", "CL", "SHW", "MCK", "AON", "EQIX", "WM", "NOC",
-    "GD", "EMR", "APD", "ITW", "FDX", "ECL", "PH", "ORLY", "AJG",
-    "NSC", "TRV", "MSI", "SLB", "AEP", "D", "WELL", "RCL", "PSA",
-    "SPG", "ALL", "KMB", "AFL", "AIG", "MET", "PRU", "TFC", "USB",
-    "PNC", "COF", "BK", "FITB", "KEY", "CFG", "RF", "HBAN", "MTB",
-    "NTRS", "STT", "CMA", "ZION",
-    # Industrials / materials
-    "MMM", "DOW", "DD", "NEM", "FCX", "CTVA", "WY", "IP", "PKG",
-    "AVY", "SEE", "SON", "OLN", "CE", "HUN", "RPM", "EMN",
-    # Healthcare
-    "HCA", "HUM", "CNC", "DXCM", "IQV", "BAX", "EW", "RMD", "HOLX",
-    "MTD", "STE", "WAT", "A", "BIO", "PKI", "TFX", "XRAY",
-    # Tech
-    "HPQ", "HPE", "DELL", "WDC", "STX", "NTAP", "GLW", "TER", "KEYS",
-    "ZBRA", "JNPR", "FFIV",
-    # Consumer
-    "TGT", "DG", "DLTR", "ROST", "BBY", "GPS", "KSS", "M", "JWN",
-    "NKE", "RL", "VFC", "PVH", "TPR", "HBI", "LEVI",
-    "SJM", "K", "GIS", "CPB", "CAG", "HSY", "MKC", "HRL", "TSN",
-    "BG", "ADM",
-    # Energy
-    "CVX", "COP", "EOG", "PXD", "PSX", "VLO", "MPC", "OXY", "HAL",
-    "BKR", "DVN", "FANG", "HES", "APA", "OVV", "MRO",
-    # Utilities
-    "SRE", "EXC", "XEL", "ED", "WEC", "ES", "AEE", "CMS", "DTE",
-    "FE", "ETR", "PPL", "CNP", "NI", "AES", "PNW", "NRG", "OGE",
-    "ATO", "LNT",
-    # REITs
-    "CCI", "O", "DLR", "VICI", "AVB", "EQR", "MAA", "UDR", "CPT",
-    "ESS", "SUI", "ELS", "REG", "FRT", "KIM", "BXP", "SLG", "HIW",
-    "VTR", "OHI", "MPW", "PEAK", "HST", "RHP",
-    # Financials
-    "GS", "MS", "C", "WFC", "BAC", "AXP", "DFS", "SYF", "ALLY",
-    "NYCB", "FNB", "SNV", "HWC", "OZK", "BOKF", "FHN", "WAL",
-    "WTFC", "PNFP", "IBOC", "UMBF", "CBSH", "GBCI", "ABCB", "SFNC",
-    "FULT", "TRMK", "UBSI", "VLY", "FBP",
-    # Telecom / Media
-    "T", "VZ", "CMCSA", "DIS", "FOX", "FOXA", "PARA", "WBD", "IPG",
-    "OMC",
-    # Transport
-    "CSX", "DAL", "UAL", "LUV", "AAL", "JBHT", "XPO", "CHRW",
-    "EXPD", "UPS",
-    # Energy infrastructure
-    "WMB", "KMI", "ET", "OKE", "TRGP", "EPD", "PAA", "AM", "CTRA",
-    "AR", "RRC", "EQT", "SWN", "CNX",
-    # Autos
-    "GM", "F", "TM", "HMC",
-    # Pharma (international ADRs on NYSE)
-    "PFE", "AZN", "NVO", "GSK", "SNY", "NVS", "TAK",
-    # Consumer staples
-    "CLX", "CHD", "EL", "SWK", "LEG", "MAS", "OC", "ALLE", "IR",
-    "XYL", "AWK", "WTRG",
-    # Industrials
-    "AME", "ROK", "ROP", "NDSN", "TRMB", "FTV", "LDOS", "BAH",
-    "SAIC", "J", "LHX", "HII", "TXT", "AOS", "SNA", "WSO", "GGG",
-    "GNRC",
-    # Agriculture / chemicals
-    "CF", "MOS", "NTR", "FMC", "ALB",
-    # Metals / mining
-    "GOLD", "AEM", "KGC", "AGI", "AU", "NUE", "STLD", "RS", "CMC",
-    "ATI", "X", "CLF",
-    # Leisure / hospitality
-    "LVS", "MGM", "WYNN", "CZR", "PENN", "MAR", "HLT", "H", "CHH",
-    "CCL", "NCLH",
-    # Restaurants
-    "YUM", "DPZ", "CMG", "QSR", "WEN", "DRI", "TXRH", "EAT",
-    # Mid-caps (additional breadth)
-    "GLOB", "FND", "LSCC", "AXON", "TDG", "IRM", "DECK", "GWW",
-    "URI", "FAST", "ODFL", "SAIA", "WDAY", "SNOW", "DDOG", "NET",
-    "ZS", "CRWD", "PANW", "FTNT", "NOW", "TEAM", "VEEV", "ANSS",
-    "CPRT", "CSGP", "VRSK", "CDW", "BR", "TTEK", "PAYC", "WEX",
-    "GWRE", "PCOR", "PEGA", "MANH", "BILL", "SHOP", "SQ", "PYPL",
-    "FIS", "FISV", "GPN", "WU", "EEFT", "FLYW",
-    "WST", "TECH", "ICLR", "MEDP", "CRL",
-    "PODD", "ALGN", "ISRG", "IDXX", "RVTY",
-    "POOL", "WSM", "RH", "BURL", "FIVE", "ULTA", "LULU",
-    "CMI", "DOV", "IEX", "NDSN", "RBC", "WTS", "BMI", "FELE",
-    "SITE", "BCPC", "IOSP", "KWR", "ESE",
+# ---------- Source 3: Hardcoded 600+ fallback ------------------------
+
+_HARDCODED_TICKERS = [
+    # ── MEGA / LARGE CAP (NYSE + NASDAQ) ──
+    "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "GOOG", "META", "TSLA",
+    "BRK", "UNH", "XOM", "JNJ", "JPM", "V", "PG", "MA", "AVGO", "HD",
+    "CVX", "MRK", "ABBV", "LLY", "COST", "PEP", "KO", "ADBE", "WMT",
+    "BAC", "CRM", "MCD", "CSCO", "TMO", "ACN", "ABT", "NFLX", "AMD",
+    "LIN", "DHR", "TXN", "WFC", "PM", "NEE", "UPS", "ORCL", "INTC",
+    "RTX", "QCOM", "HON", "AMGN", "UNP", "INTU", "CAT", "LOW", "SPGI",
+    "BA", "GE", "ISRG", "BLK", "DE", "GILD", "MDLZ", "ADP", "SYK",
+    "BKNG", "VRTX", "SBUX", "MMC", "PLD", "TMUS", "ADI", "LRCX",
+    "TJX", "CB", "PANW", "AXP", "CI", "SCHW", "REGN", "ZTS", "MO",
+    "SO", "FISV", "CME", "DUK", "EQIX", "BSX", "BDX", "SNPS", "CDNS",
+    "ICE", "CL", "CSX", "EOG", "AON", "NOC", "SHW", "MPC", "PH",
+    "MCK", "APD", "EMR", "ORLY", "TT", "PSX", "GD", "PYPL",
+    "USB", "ITW", "WELL", "PNC", "HUM", "MRVL", "FCX", "ROP",
+    # ── MID-CAP / GROWTH ──
+    "CRWD", "DDOG", "SNOW", "NET", "ZS", "MDB", "TEAM", "HUBS",
+    "FTNT", "TTD", "WDAY", "OKTA", "BILL", "DKNG", "RBLX", "PINS",
+    "SNAP", "ROKU", "LYFT", "UBER", "DASH", "ABNB", "COIN", "HOOD",
+    "SQ", "SOFI", "AFRM", "UPST", "MELI", "SE", "GRAB", "NU",
+    "SHOP", "SPOT", "U", "PATH", "CFLT", "FROG", "ESTC", "GTLB",
+    "MNDY", "DOCN", "TOST", "CAVA", "CART", "BIRK", "DUOL",
+    "APP", "CELH", "ELF", "ONON", "DECK", "LULU", "MNST", "WING",
+    "TXRH", "CMG", "CTAS", "ODFL", "SAIA", "XPO", "KNSL", "ARES",
+    "OWL", "APO", "KKR", "BX", "CG", "HLNE", "TPG", "BAM",
+    # ── BIOTECH / PHARMA ──
+    "MRNA", "BNTX", "BMRN", "ALNY", "SRPT", "EXAS", "IONS", "PCVX",
+    "LEGN", "ARGX", "KRYS", "XENE", "RYTM", "CRNX", "ACAD", "PTCT",
+    "INSM", "RARE", "HALO", "NBIX", "AXSM", "CORT", "TGTX", "FOLD",
+    "IRON", "RVMD", "KRTX", "PRTA", "ANNX", "DAWN", "SAVA", "APLS",
+    "RCKT", "BEAM", "CRSP", "NTLA", "EDIT", "VERV", "PRME",
+    "VERA", "IMVT", "RLAY", "CYTK", "CPRX", "GERN",
+    # ── SMALL-CAP / SPECULATIVE ──
+    "PLTR", "IONQ", "RGTI", "QUBT", "SMCI", "SOUN", "BBAI", "JOBY",
+    "LILM", "ACHR", "LUNR", "RKLB", "ASTS", "SATS", "SPCE",
+    "DNA", "GEVO", "PLUG", "FCEL", "BE", "BLDP", "CHPT", "BLNK",
+    "EVGO", "QS", "MVST", "PTRA", "GOEV", "LCID", "RIVN", "FSR",
+    "NKLA", "LAZR", "LIDR", "OUST", "AEVA", "CPNG", "BABA",
+    "JD", "PDD", "BIDU", "NIO", "XPEV", "LI", "BILI", "TME",
+    "IQ", "FUTU", "TIGR", "WB", "ZH", "MNSO", "YMM", "DADA",
+    "FFIE", "MULN", "NRDS", "CLOV", "WISH",
+    # ── FINANCIALS / REITS ──
+    "GS", "MS", "C", "HBAN", "KEY", "RF", "CFG", "FITB",
+    "MTB", "SIVB", "ZION", "CMA", "TFC", "STT", "NTRS", "BK",
+    "ALLY", "DFS", "COF", "AIG", "MET", "PRU", "AFL", "TRV",
+    "ALL", "PGR", "HIG", "L", "GL", "WRB", "RE", "RNR",
+    "AMT", "CCI", "SBAC", "DLR", "SPG", "O", "VICI", "GLPI",
+    "NNN", "WPC", "ADC", "STAG", "FR", "REXR", "ARE", "BXP",
+    "VTR", "PEAK", "OHI", "MPW", "DOC", "HR",
+    # ── ENERGY / MATERIALS ──
+    "SLB", "HAL", "BKR", "OXY", "COP", "DVN", "PXD", "FANG",
+    "APA", "CTRA", "EQT", "AR", "RRC", "SWN", "MUR", "OVV",
+    "SM", "CHRD", "MTDR", "PR", "VNOM", "MGY", "CLR",
+    "KMI", "WMB", "OKE", "ET", "EPD", "MPLX", "PAA", "TRGP",
+    "NUE", "STLD", "CLF", "X", "RS", "ATI", "CMC", "CENX",
+    "AA", "ARNC", "KALU", "HAYN", "TMST", "IOSP", "TROX",
+    "APD", "LIN", "ECL", "SHW", "PPG", "RPM", "VMC", "MLM",
+    # ── INDUSTRIALS / DEFENCE ──
+    "LMT", "RTX", "GD", "NOC", "BA", "TXT", "HII", "LHX",
+    "LDOS", "BAH", "SAIC", "CACI", "BWXT", "HEI", "TDG", "MOG",
+    "CW", "GR", "SPR", "ERJ", "ALGT", "HA", "ALK", "JBLU",
+    "DAL", "UAL", "LUV", "AAL", "SAVE", "SKYW", "MESA", "ATSG",
+    "FDX", "UPS", "XPO", "SAIA", "ODFL", "JBHT", "LSTR", "WERN",
+    "KNX", "SNDR", "CHRW", "EXPD", "FWRD", "HUBG", "MATX",
+    # ── CONSUMER / RETAIL ──
+    "AMZN", "WMT", "TGT", "COST", "DG", "DLTR", "BJ", "OLLI",
+    "FIVE", "ROST", "TJX", "BURL", "GPS", "ANF", "AEO", "URBN",
+    "LULU", "NKE", "CROX", "SKX", "DECK", "ONON", "BIRD", "HOKA",
+    "DIS", "CMCSA", "WBD", "PARA", "NFLX", "ROKU", "LGF",
+    "RBLX", "EA", "TTWO", "ATVI", "ZNGA", "PLTK", "SKLZ",
+    "MCD", "SBUX", "CMG", "YUM", "QSR", "WING", "TXRH", "DRI",
+    "CAKE", "EAT", "DIN", "JACK", "SHAK", "BROS", "LOCO",
+    # ── TECH HARDWARE / SEMIS ──
+    "TSM", "ASML", "KLAC", "AMAT", "LRCX", "TER", "ONTO",
+    "COHR", "MKSI", "ENTG", "AEHR", "ACLS", "WOLF", "SLAB",
+    "MPWR", "SWKS", "QRVO", "MCHP", "NXPI", "ON", "DIOD",
+    "STM", "UMC", "GFS", "RMBS", "CRUS", "SITM", "POWI",
+    "ALGM", "AMBA", "LSCC", "INDI", "SMTC", "ACMR",
+    # ── ETFS (broad coverage) ──
+    "SPY", "QQQ", "IWM", "DIA", "VTI", "VOO", "VXF", "VTWO",
+    "MDY", "IJR", "IVV", "SPLG", "SCHB", "ITOT", "VT", "VXUS",
+    "EFA", "EEM", "VWO", "IEMG", "GLD", "SLV", "GDX", "GDXJ",
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU",
+    "XLB", "XLRE", "XLC", "XBI", "IBB", "ARKG", "ARKK", "ARKF",
+    "ARKQ", "ARKW", "SOXL", "SOXS", "TQQQ", "SQQQ", "SPXL",
+    "SPXS", "UVXY", "VXX", "TLT", "TBT", "HYG", "LQD", "JNK",
+    "SCHD", "VYM", "DVY", "SDY", "DGRO", "NOBL", "VIG", "DGRW",
+    "JEPI", "JEPQ", "XYLD", "QYLD", "RYLD", "NUSI", "DIVO",
+    "SMH", "SOXX", "PSI", "QTEC", "SKYY", "HACK", "BUG", "CIBR",
+    "KWEB", "FXI", "MCHI", "ASHR", "YINN", "YANG", "EWJ", "EWZ",
+    "EWY", "EWT", "INDA", "SMIN", "VNM", "FM", "GREK",
 ]
 
 
-def _get_fallback_tickers() -> List[str]:
-    """Return hardcoded list of ~500 major NYSE stocks."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for t in _FALLBACK_NYSE_500:
-        s = t.replace(".", "-")  # BRK.B -> BRK-B for yfinance
-        if s not in seen and _is_valid_ticker(s):
-            seen.add(s)
-            out.append(s)
-    log.info("  [Fallback] Loaded %d hardcoded NYSE tickers.", len(out))
-    return out
+# ---------- main fetch function --------------------------------------
 
-
-def fetch_all_nyse_tickers() -> List[str]:
+def fetch_all_us_tickers() -> List[str]:
     """
-    Attempt multiple sources in order:
-      1. NASDAQ FTP file (otherlisted.txt) — filter Exchange == 'N'
-      2. Finviz full NYSE screen (all pages, no cap/vol filters)
-      3. Hardcoded fallback of 500+ major NYSE stocks
-    Returns a deduplicated list of valid ticker symbols (1,000+ target).
+    Three-tier ticker fetch covering the full US tradeable universe:
+      1. NASDAQ FTP files (primary)    → 10k-15k symbols
+      2. Finviz screener  (fallback)   → 5k-10k symbols
+      3. Hardcoded list   (emergency)  → ~600 symbols
+    Returns cleaned, deduplicated, shuffled list.
     """
-    log.info("Phase 1 — Fetching full NYSE ticker universe ...")
-    all_tickers: list[str] = []
-    sources_used: list[str] = []
+    # --- Source 1: NASDAQ FTP ---
+    log.info("[%s] Attempting NASDAQ FTP fetch …", US_SOURCE)
+    raw = _fetch_nasdaq_ftp()
+    if len(raw) >= 5000:
+        return _clean_tickers(raw)
 
-    # Source 1: FTP
-    ftp_tickers = _fetch_nyse_from_ftp()
-    if ftp_tickers:
-        all_tickers.extend(ftp_tickers)
-        sources_used.append(f"FTP({len(ftp_tickers)})")
-
-    # Source 2: Finviz (only if FTP gave < 1000)
-    if len(set(all_tickers)) < 1000:
-        fv_tickers = _fetch_nyse_from_finviz()
-        if fv_tickers:
-            all_tickers.extend(fv_tickers)
-            sources_used.append(f"Finviz({len(fv_tickers)})")
-
-    # Deduplicate
-    seen: set[str] = set()
-    unique: list[str] = []
-    for t in all_tickers:
-        t = t.strip().upper().replace(".", "-")
-        if t not in seen and _is_valid_ticker(t):
-            seen.add(t)
-            unique.append(t)
-
-    # Source 3: fallback if still below 1000
-    if len(unique) < 1000:
-        fb = _get_fallback_tickers()
-        for t in fb:
-            if t not in seen:
-                seen.add(t)
-                unique.append(t)
-        sources_used.append(f"Fallback({len(fb)})")
-
-    # Also merge in the original momentum-filtered Finviz screen for bonus picks
+    # --- Source 2: Finviz ---
+    log.info("[%s] FTP yielded only %d; trying Finviz …", US_SOURCE, len(raw))
     try:
-        fv_filtered = scrape_finviz_screen(
-            base_url=FINVIZ_SCREEN_URL,
-            max_tickers=300,
-            label="momentum-filter",
-        )
-        if not fv_filtered.empty:
-            for col in ("Ticker", "ticker", "Symbol", "symbol"):
-                if col in fv_filtered.columns:
-                    for t in fv_filtered[col].dropna().unique():
-                        t = t.strip().upper().replace(".", "-")
-                        if t not in seen and _is_valid_ticker(t):
-                            seen.add(t)
-                            unique.append(t)
-                    break
-    except Exception:
-        pass
+        raw2 = scrape_finviz_screen()
+        if len(raw2) >= 3000:
+            return _clean_tickers(raw2)
+        # merge whatever we got
+        raw.extend(raw2)
+        if len(raw) >= 3000:
+            return _clean_tickers(raw)
+    except Exception as exc:
+        log.warning("Finviz fallback failed: %s", exc)
 
-    log.info(
-        "Phase 1 complete — %d unique NYSE tickers collected  [sources: %s]",
-        len(unique),
-        ", ".join(sources_used) if sources_used else "none",
-    )
-    return unique
+    # --- Source 3: Hardcoded ---
+    log.info("[%s] Using hardcoded %d-ticker emergency list",
+             US_SOURCE, len(_HARDCODED_TICKERS))
+    raw.extend(_HARDCODED_TICKERS)
+    return _clean_tickers(raw)
 
 
-# ======================================================================
-# 2. Phase 1 — Fast Bulk Filter
-# ======================================================================
-def _compute_rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
-    """Vectorised RSI over a whole Series — returns a Series."""
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0.0).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+# =====================================================================
+#  MARKET REGIME CHECK
+# =====================================================================
 
-
-def _fast_score_dataframe(df: pd.DataFrame) -> Dict[str, float]:
+def check_market_regime() -> Dict[str, Any]:
     """
-    Given a multi-ticker OHLCV DataFrame (from yf.download with multiple
-    tickers), compute a fast composite score (0-100) per ticker.
-
-    Metrics (equal-weight for speed):
-      1. RSI-14           -> 0-25 pts  (sweet spot 40-65)
-      2. Price vs SMA-20  -> 0-25 pts
-      3. Price vs SMA-50  -> 0-25 pts
-      4. 5-day momentum   -> 0-25 pts
+    Quick read on broad market conditions via SPY.
+    Returns dict with trend, breadth estimate, and vix-proxy.
     """
-    scores: dict[str, float] = {}
-
-    # df has MultiIndex columns: (Price, Ticker)
+    regime: Dict[str, Any] = {
+        "trend": "neutral",
+        "spy_above_200d": None,
+        "spy_above_50d": None,
+        "vix_proxy": None,
+    }
     try:
-        close_df = df["Close"] if "Close" in df.columns.get_level_values(0) else df
-    except Exception:
-        close_df = df
+        spy = yf.Ticker("SPY")
+        hist = spy.history(period="1y", interval="1d")
+        if hist.empty:
+            return regime
+        close = hist["Close"]
+        last = close.iloc[-1]
+        if len(close) >= 200:
+            regime["spy_above_200d"] = bool(last > close.rolling(200).mean().iloc[-1])
+        if len(close) >= 50:
+            regime["spy_above_50d"] = bool(last > close.rolling(50).mean().iloc[-1])
+        # simple vix proxy: 20-day realized vol annualised
+        if len(close) >= 21:
+            ret = close.pct_change().dropna().tail(20)
+            regime["vix_proxy"] = round(float(ret.std() * np.sqrt(252) * 100), 1)
+        if regime["spy_above_200d"] and regime["spy_above_50d"]:
+            regime["trend"] = "bullish"
+        elif not regime["spy_above_200d"] and not regime["spy_above_50d"]:
+            regime["trend"] = "bearish"
+    except Exception as exc:
+        log.warning("Market regime check failed: %s", exc)
+    return regime
 
-    if isinstance(close_df, pd.Series):
-        # Only one ticker — cannot iterate columns
-        return scores
 
-    for ticker in close_df.columns:
+# =====================================================================
+#  PHASE 1 – BULK FILTER
+# =====================================================================
+
+def phase1_bulk_filter(tickers: List[str], top_n: int = PHASE1_TOP_N,
+                       ) -> List[Tuple[str, float, float, int]]:
+    """
+    Fast screen: download daily bars for all tickers in batches,
+    rank by a simple momentum × relative-volume composite.
+    Returns list of (symbol, last_close, change_pct, volume) sorted desc.
+    """
+    log.info("Phase-1: bulk-filtering %d tickers (top %d)", len(tickers), top_n)
+    results: List[Tuple[str, float, float, float, int]] = []
+
+    for i in range(0, len(tickers), YF_GROUP_SIZE):
+        batch = tickers[i : i + YF_GROUP_SIZE]
         try:
-            close = close_df[ticker].dropna()
-            if len(close) < PHASE1_MIN_ROWS:
-                continue
-
-            last = close.iloc[-1]
-            if pd.isna(last) or last <= 0:
-                continue
-
-            pts = 0.0
-
-            # 1. RSI-14  (0-25)
-            rsi_series = _compute_rsi_series(close, 14)
-            rsi = rsi_series.iloc[-1]
-            if pd.isna(rsi):
-                rsi = 50.0
-            if 40 <= rsi <= 65:
-                pts += 25
-            elif 30 <= rsi < 40 or 65 < rsi <= 75:
-                pts += 15
-            elif rsi > 75:
-                pts += 5   # overbought caution
-            else:
-                pts += 5
-
-            # 2. Price vs SMA-20  (0-25)
-            sma20 = close.rolling(20).mean().iloc[-1]
-            if not pd.isna(sma20) and sma20 > 0:
-                pct_above_20 = (last - sma20) / sma20
-                if pct_above_20 > 0.05:
-                    pts += 25
-                elif pct_above_20 > 0:
-                    pts += 18
-                elif pct_above_20 > -0.03:
-                    pts += 10
-                else:
-                    pts += 0
-
-            # 3. Price vs SMA-50  (0-25)
-            if len(close) >= 50:
-                sma50 = close.rolling(50).mean().iloc[-1]
-                if not pd.isna(sma50) and sma50 > 0:
-                    pct_above_50 = (last - sma50) / sma50
-                    if pct_above_50 > 0.05:
-                        pts += 25
-                    elif pct_above_50 > 0:
-                        pts += 18
-                    elif pct_above_50 > -0.03:
-                        pts += 10
-                    else:
-                        pts += 0
-            else:
-                pts += 10  # neutral if not enough data
-
-            # 4. 5-day momentum  (0-25)
-            if len(close) >= 6:
-                mom = (close.iloc[-1] / close.iloc[-6] - 1) * 100
-                if 1 <= mom <= 8:
-                    pts += 25
-                elif 0 < mom < 1:
-                    pts += 15
-                elif mom > 8:
-                    pts += 10  # extended
-                elif mom > -2:
-                    pts += 5
-                else:
-                    pts += 0
-
-            scores[ticker] = pts
-        except Exception:
+            df = yf.download(
+                batch,
+                period=YF_PERIOD,
+                interval=YF_INTERVAL,
+                group_by="ticker",
+                threads=True,
+                progress=False,
+            )
+        except Exception as exc:
+            log.warning("yf.download batch %d failed: %s", i // YF_GROUP_SIZE, exc)
             continue
 
-    return scores
+        for sym in batch:
+            try:
+                if len(batch) == 1:
+                    sub = df
+                else:
+                    sub = df[sym] if sym in df.columns.get_level_values(0) else None
+                if sub is None or sub.empty:
+                    continue
+                sub = sub.dropna(subset=["Close"])
+                if len(sub) < 10:
+                    continue
+                close = sub["Close"]
+                vol = sub["Volume"]
+                last_close = float(close.iloc[-1])
+                if last_close < 1.0:
+                    continue  # penny stocks
+                pct_5d = float((close.iloc[-1] / close.iloc[-6] - 1) * 100) if len(close) >= 6 else 0.0
+                avg_vol = float(vol.tail(20).mean()) if len(vol) >= 20 else float(vol.mean())
+                last_vol = float(vol.iloc[-1])
+                if avg_vol < 50_000:
+                    continue  # illiquid
+                rel_vol = last_vol / avg_vol if avg_vol > 0 else 1.0
+                composite = pct_5d * 0.6 + (rel_vol - 1) * 40 * 0.4
+                results.append((sym, last_close, pct_5d, composite, int(last_vol)))
+            except Exception:
+                continue
+
+    results.sort(key=lambda x: x[3], reverse=True)
+    top = results[:top_n]
+    log.info("Phase-1 done: %d passed liquidity filter, returning top %d",
+             len(results), len(top))
+    return [(s, p, c, v) for s, p, c, _, v in top]
 
 
-def phase1_bulk_filter(
-    tickers: List[str], top_n: int = PHASE1_TOP_N
-) -> List[str]:
+# =====================================================================
+#  SCORING FUNCTIONS
+# =====================================================================
+
+def score_technical(hist: pd.DataFrame, info: dict) -> Tuple[float, List[str]]:
     """
-    Downloads OHLCV data in batches for ALL tickers.
-    Computes fast metrics: RSI, MA alignment, momentum.
-    Returns top_n tickers sorted by composite fast-score.
-    Logs progress every batch.
+    Technical scoring: trend, RSI, MACD, Bollinger position,
+    plus gap-up and volume-surge detection.  Cap = 30.
     """
-    log.info(
-        "Phase 2 — Fast bulk filter on %d tickers (batch size %d) ...",
-        len(tickers), PHASE1_BATCH_SIZE,
-    )
-    phase1_start = time.time()
+    pts = 0.0
+    notes: List[str] = []
+    if hist.empty or len(hist) < 20:
+        return 0, ["Insufficient history"]
 
-    all_scores: dict[str, float] = {}
-    n_batches = math.ceil(len(tickers) / PHASE1_BATCH_SIZE)
+    close = hist["Close"]
+    high = hist["High"]
+    low = hist["Low"]
+    volume = hist["Volume"]
+    last = float(close.iloc[-1])
 
-    for batch_idx in range(n_batches):
-        lo = batch_idx * PHASE1_BATCH_SIZE
-        hi = min(lo + PHASE1_BATCH_SIZE, len(tickers))
-        batch = tickers[lo:hi]
-
-        if batch_idx % 5 == 0 or batch_idx == n_batches - 1:
-            log.info(
-                "  Phase 1 batch %d/%d  (tickers %d-%d: %s ... %s)  [%d scored so far]",
-                batch_idx + 1, n_batches, lo + 1, hi,
-                batch[0], batch[-1], len(all_scores),
-            )
-
-        try:
-            data = yf.download(
-                batch,
-                period=PHASE1_PERIOD,
-                progress=False,
-                threads=True,
-                group_by="column",
-            )
-            if data is not None and not data.empty:
-                batch_scores = _fast_score_dataframe(data)
-                all_scores.update(batch_scores)
-        except Exception as exc:
-            log.warning("  Batch %d failed: %s", batch_idx + 1, exc)
-
-        # Timeout guard
-        phase1_elapsed = time.time() - phase1_start
-        if phase1_elapsed > MAX_PHASE1_MINUTES * 60:
-            log.warning(
-                "  Phase 1 exceeded %d min — stopping early (%d tickers scored).",
-                MAX_PHASE1_MINUTES, len(all_scores),
-            )
-            break
-        if _timeout_reached():
-            log.warning("  Global timeout reached in Phase 1 — stopping.")
-            break
-
-    # Sort and select top N
-    ranked = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
-
-    # If too few passed, take whatever we have
-    effective_top_n = top_n
-    if len(ranked) < 50 and len(ranked) > 0:
-        effective_top_n = len(ranked)
-        log.warning(
-            "  Only %d tickers scored — taking all of them.", len(ranked)
-        )
-    elif len(ranked) == 0:
-        log.error("  Phase 1 scored 0 tickers.")
-        return []
-
-    survivors = [sym for sym, _ in ranked[:effective_top_n]]
-
-    phase1_time = time.time() - phase1_start
-    log.info(
-        "Phase 1 complete: %d tickers scored -> top %d candidates  (%.1f min)",
-        len(all_scores), len(survivors), phase1_time / 60,
-    )
-
-    # Log top-10 fast scores for transparency
-    for i, (sym, sc) in enumerate(ranked[:10], 1):
-        log.info("    fast-rank #%d  %s  %.0f/100", i, sym, sc)
-
-    # Adjust Phase 2 size if Phase 1 was slow
-    if phase1_time > MAX_PHASE1_MINUTES * 60 and effective_top_n > 100:
-        log.info(
-            "  Reducing Phase 2 pool from %d to 100 (time pressure).",
-            effective_top_n,
-        )
-        survivors = survivors[:100]
-
-    return survivors
-
-
-# ======================================================================
-# 3. Phase 2 — Full 5-Layer Deep Dive
-# ======================================================================
-
-# --- 3A. Catalyst (25 pts) -------------------------------------------
-def _upcoming_earnings_check(ticker_obj: yf.Ticker) -> Tuple[bool, str]:
-    """Check if earnings date falls within the next 14 days."""
-    try:
-        cal = ticker_obj.calendar
-        if cal is None:
-            return False, ""
-        if isinstance(cal, dict):
-            dates = cal.get("Earnings Date", [])
-        elif isinstance(cal, pd.DataFrame):
-            dates = (
-                cal.loc["Earnings Date"].tolist()
-                if "Earnings Date" in cal.index
-                else []
-            )
+    # ── Moving-average trend ──
+    if len(close) >= 50:
+        ma50 = float(close.rolling(50).mean().iloc[-1])
+        if last > ma50:
+            pts += 4
+            notes.append(f"Above MA50 ({ma50:.2f})")
         else:
-            dates = []
-        now = dt.datetime.now(tz=dt.timezone.utc)
-        for d in dates:
-            if isinstance(d, str):
-                d = pd.Timestamp(d)
-            if hasattr(d, "date"):
-                try:
-                    diff = (d.date() - now.date()).days
-                except Exception:
-                    diff = -1
-                if 0 <= diff <= 14:
-                    return True, f"Earnings in ~{diff}d"
+            pts -= 2
+    if len(close) >= 20:
+        ma20 = float(close.rolling(20).mean().iloc[-1])
+        if last > ma20:
+            pts += 3
+
+    # ── RSI(14) ──
+    if len(close) >= 15:
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain.iloc[-1] / loss.iloc[-1] if loss.iloc[-1] != 0 else 100
+        rsi = 100 - 100 / (1 + rs)
+        if 50 < rsi < 70:
+            pts += 4
+            notes.append(f"RSI {rsi:.0f} bullish")
+        elif 30 < rsi <= 50:
+            pts += 1
+        elif rsi >= 70:
+            pts += 1
+            notes.append(f"RSI {rsi:.0f} overbought")
+        else:
+            pts -= 1
+            notes.append(f"RSI {rsi:.0f} oversold")
+
+    # ── MACD ──
+    if len(close) >= 26:
+        ema12 = close.ewm(span=12).mean()
+        ema26 = close.ewm(span=26).mean()
+        macd = ema12 - ema26
+        sig = macd.ewm(span=9).mean()
+        if float(macd.iloc[-1]) > float(sig.iloc[-1]):
+            pts += 4
+            notes.append("MACD bullish cross")
+        else:
+            pts -= 1
+
+    # ── Bollinger Band position ──
+    if len(close) >= 20:
+        sma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std()
+        upper = float(sma20.iloc[-1] + 2 * std20.iloc[-1])
+        lower = float(sma20.iloc[-1] - 2 * std20.iloc[-1])
+        band_range = upper - lower
+        if band_range > 0:
+            position = (last - lower) / band_range
+            if 0.5 < position < 0.85:
+                pts += 3
+                notes.append(f"BB position {position:.0%}")
+            elif position >= 0.85:
+                pts += 1
+                notes.append(f"BB near upper {position:.0%}")
+
+    # ── NEW: Gap-up detection ──
+    if len(hist) >= 2:
+        yesterday_close = float(close.iloc[-2])
+        today_open = float(hist["Open"].iloc[-1])
+        if yesterday_close > 0 and today_open > yesterday_close * 1.005:
+            gap_pct = (today_open / yesterday_close - 1) * 100
+            pts += 3
+            notes.append(f"Gap up {gap_pct:.1f}%")
+
+    # ── NEW: Volume-surge detection ──
+    if len(volume) >= 21:
+        avg_vol = float(volume.tail(20).iloc[:-1].mean())  # 20-day avg excl today
+        today_vol = float(volume.iloc[-1])
+        if avg_vol > 0 and today_vol > 2 * avg_vol:
+            price_up = float(close.iloc[-1]) > float(close.iloc[-2]) if len(close) >= 2 else False
+            if price_up:
+                ratio = today_vol / avg_vol
+                pts += 2
+                notes.append(f"Vol surge {ratio:.1f}x")
+
+    return min(pts, TECH_CAP), notes
+
+
+def score_fundamentals(info: dict) -> Tuple[float, List[str]]:
+    """Fundamental quality + value scoring.  Cap = 25."""
+    pts = 0.0
+    notes: List[str] = []
+
+    # PE ratio
+    pe = info.get("forwardPE") or info.get("trailingPE")
+    if pe and 0 < pe < 25:
+        pts += 4
+        notes.append(f"PE {pe:.1f}")
+    elif pe and 25 <= pe < 50:
+        pts += 2
+
+    # Revenue growth
+    rev_growth = info.get("revenueGrowth")
+    if rev_growth and rev_growth > 0.15:
+        pts += 5
+        notes.append(f"Rev growth {rev_growth:.0%}")
+    elif rev_growth and rev_growth > 0.05:
+        pts += 3
+
+    # Profit margin
+    margin = info.get("profitMargins")
+    if margin and margin > 0.20:
+        pts += 4
+        notes.append(f"Margin {margin:.0%}")
+    elif margin and margin > 0.10:
+        pts += 2
+
+    # ROE
+    roe = info.get("returnOnEquity")
+    if roe and roe > 0.20:
+        pts += 4
+        notes.append(f"ROE {roe:.0%}")
+    elif roe and roe > 0.10:
+        pts += 2
+
+    # Debt / equity
+    de = info.get("debtToEquity")
+    if de is not None:
+        if de < 50:
+            pts += 3
+            notes.append(f"Low D/E {de:.0f}%")
+        elif de > 200:
+            pts -= 2
+            notes.append(f"High D/E {de:.0f}%")
+
+    # Free cash flow yield
+    mcap = info.get("marketCap") or 0
+    fcf = info.get("freeCashflow") or 0
+    if mcap > 0 and fcf > 0:
+        fcf_yield = fcf / mcap
+        if fcf_yield > 0.05:
+            pts += 3
+            notes.append(f"FCF yield {fcf_yield:.1%}")
+
+    return min(pts, FUND_CAP), notes
+
+
+def score_options(info: dict) -> Tuple[float, List[str]]:
+    """Options-implied signals.  Cap = 20."""
+    pts = 0.0
+    notes: List[str] = []
+
+    iv = info.get("impliedVolatility")
+    if iv:
+        if iv > 0.6:
+            pts += 3
+            notes.append(f"High IV {iv:.0%}")
+        elif iv > 0.3:
+            pts += 1
+
+    # Put/call OI ratio from info (if available)
+    pcr = info.get("putCallRatio")
+    if pcr:
+        if pcr < 0.7:
+            pts += 4
+            notes.append(f"Bullish P/C {pcr:.2f}")
+        elif pcr > 1.3:
+            pts -= 2
+            notes.append(f"Bearish P/C {pcr:.2f}")
+
+    # Try options chain for richer data
+    try:
+        ticker_obj = None
+        sym = info.get("symbol")
+        if sym:
+            ticker_obj = yf.Ticker(sym)
+            exps = ticker_obj.options
+            if exps:
+                chain = ticker_obj.option_chain(exps[0])
+                call_oi = int(chain.calls["openInterest"].sum())
+                put_oi = int(chain.puts["openInterest"].sum())
+                total_oi = call_oi + put_oi
+                if total_oi > 10_000:
+                    pts += 3
+                    notes.append(f"Active options OI {total_oi:,}")
+                if call_oi > 0 and put_oi > 0:
+                    r = put_oi / call_oi
+                    if r < 0.7:
+                        pts += 3
+                        notes.append(f"Call-heavy OI ratio {r:.2f}")
+                    elif r > 1.5:
+                        pts -= 1
+                # unusual volume
+                call_vol = chain.calls["volume"].sum()
+                put_vol = chain.puts["volume"].sum()
+                opt_vol = call_vol + put_vol
+                if opt_vol > 5000:
+                    pts += 2
+                    notes.append(f"Opt vol {int(opt_vol):,}")
     except Exception:
         pass
-    return False, ""
+
+    return min(pts, OPT_CAP), notes
 
 
-def _insider_buy_signal(symbol: str) -> Tuple[bool, str]:
-    """Quick check for recent insider purchases via OpenInsider."""
-    url = (
-        f"http://openinsider.com/screener?s={symbol}&o=&pl=&ph=&ll=&lh="
-        f"&fd=30&fdr=&td=0&tdr=&feession=&fq=&fquarter=&sid=&ta=1&tl="
-        f"&tc=&tr=&tdiv=&sig=&sod=68&sfl=&sio=&sit=&rp=1"
-    )
-    resp = _get(url, timeout=10)
-    if resp is None:
-        return False, ""
+def score_catalyst(info: dict) -> Tuple[float, List[str]]:
+    """Catalyst / event scoring.  Cap = 25."""
+    pts = 0.0
+    notes: List[str] = []
+
+    # Earnings proximity
+    earn_date = info.get("earningsDate")
+    if earn_date:
+        if isinstance(earn_date, list):
+            earn_date = earn_date[0] if earn_date else None
+        if earn_date:
+            try:
+                if hasattr(earn_date, "timestamp"):
+                    ed = earn_date
+                else:
+                    ed = pd.Timestamp(earn_date)
+                days_to = (ed - pd.Timestamp.now()).days
+                if 0 < days_to <= 14:
+                    pts += 5
+                    notes.append(f"Earnings in {days_to}d")
+                elif 0 < days_to <= 30:
+                    pts += 3
+                    notes.append(f"Earnings in {days_to}d")
+            except Exception:
+                pass
+
+    # Analyst recommendation
+    rec = info.get("recommendationMean")
+    if rec:
+        if rec <= 2.0:
+            pts += 4
+            notes.append(f"Strong analyst buy ({rec:.1f})")
+        elif rec <= 2.5:
+            pts += 2
+            notes.append(f"Analyst buy ({rec:.1f})")
+
+    # Target price upside
+    target = info.get("targetMeanPrice")
+    price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+    if target and price and price > 0:
+        upside = (target - price) / price
+        if upside > 0.20:
+            pts += 4
+            notes.append(f"Target upside {upside:.0%}")
+        elif upside > 0.10:
+            pts += 2
+
+    # Insider buying
+    insider = info.get("heldPercentInsiders")
+    if insider and insider > 0.10:
+        pts += 2
+        notes.append(f"Insider own {insider:.1%}")
+
+    # ── NEW: Short-squeeze signal ──
+    short_pct = info.get("shortPercentOfFloat") or 0
+    if short_pct > 0.20:
+        pts += 5
+        notes.append(f"High short float {short_pct:.0%} – squeeze risk")
+    elif short_pct > 0.10:
+        pts += 2
+        notes.append(f"Elevated short float {short_pct:.0%}")
+
+    return min(pts, CAT_CAP), notes
+
+
+def score_news(symbol: str) -> Tuple[float, List[str]]:
+    """Simple headline-sentiment scoring via yfinance news.  Cap = 15."""
+    pts = 0.0
+    notes: List[str] = []
     try:
-        soup = BeautifulSoup(resp.text, "html.parser")
-        buy_table = soup.find("table", class_="tinytable")
-        if buy_table:
-            rows = buy_table.find_all("tr")
-            buy_count = max(0, len(rows) - 1)
-            if buy_count >= 2:
-                return True, f"{buy_count} insider buys (30d)"
+        t = yf.Ticker(symbol)
+        news = t.news or []
+        if not news:
+            return 0, ["No recent news"]
+        pos = neg = 0
+        for item in news[:10]:
+            title = (item.get("title") or "").lower()
+            for w in _POS_WORDS:
+                if w in title:
+                    pos += 1
+            for w in _NEG_WORDS:
+                if w in title:
+                    neg += 1
+        net = pos - neg
+        if net >= 3:
+            pts += 6
+            notes.append(f"News very positive ({pos}+/{neg}-)")
+        elif net >= 1:
+            pts += 3
+            notes.append(f"News positive ({pos}+/{neg}-)")
+        elif net <= -3:
+            pts -= 4
+            notes.append(f"News very negative ({pos}+/{neg}-)")
+        elif net <= -1:
+            pts -= 2
+            notes.append(f"News negative ({pos}+/{neg}-)")
+        else:
+            notes.append(f"News neutral ({pos}+/{neg}-)")
     except Exception:
-        pass
-    return False, ""
+        notes.append("News fetch failed")
+    return min(max(pts, -NEWS_CAP), NEWS_CAP), notes
 
 
-def score_catalyst(result: TickerResult, ticker_obj: yf.Ticker) -> None:
-    """Catalyst layer — up to 25 points."""
-    points = 0.0
-    notes_parts: list[str] = []
+# =====================================================================
+#  DEEP-DIVE ANALYSIS
+# =====================================================================
 
-    # 1) Earnings catalyst (0-10 pts)
-    has_earnings, e_note = _upcoming_earnings_check(ticker_obj)
-    if has_earnings:
-        points += 10
-        notes_parts.append(e_note)
-
-    # 2) Insider buying (0-8 pts)
-    has_insider, i_note = _insider_buy_signal(result.symbol)
-    if has_insider:
-        points += 8
-        notes_parts.append(i_note)
-    time.sleep(REQUEST_DELAY)
-
-    # 3) Recent major news / M&A / FDA — keyword scan
-    try:
-        news_items = ticker_obj.news or []
-        catalyst_keywords = [
-            "fda", "approval", "acquisition", "merger", "buyout",
-            "upgrade", "initiate", "partnership", "contract", "award",
-        ]
-        catalyst_hits = 0
-        for item in news_items[:10]:
-            title = (
-                item.get("title")
-                or item.get("content", {}).get("title", "")
-            ).lower()
-            if any(kw in title for kw in catalyst_keywords):
-                catalyst_hits += 1
-        cat_pts = min(catalyst_hits * 3.5, 7)
-        points += cat_pts
-        if catalyst_hits:
-            notes_parts.append(f"{catalyst_hits} catalyst headline(s)")
-    except Exception:
-        pass
-
-    result.catalyst_score = min(points, 25)
-    result.catalyst_notes = (
-        "; ".join(notes_parts) if notes_parts else "No major catalysts detected"
-    )
-
-
-# --- 3B. Options / UOA (20 pts) --------------------------------------
-def score_options(result: TickerResult, ticker_obj: yf.Ticker) -> None:
-    """Options / UOA layer — up to 20 points."""
-    points = 0.0
-    notes_parts: list[str] = []
-
-    try:
-        expirations = ticker_obj.options
-        if not expirations:
-            result.options_score = 0
-            result.options_notes = "No options data available"
-            return
-
-        nearest_exp = expirations[0]
-        chain = ticker_obj.option_chain(nearest_exp)
-        calls = chain.calls
-        puts = chain.puts
-
-        if calls.empty and puts.empty:
-            result.options_score = 0
-            result.options_notes = "Options chain empty"
-            return
-
-        # Put / Call volume ratio
-        total_call_vol = calls["volume"].sum() if "volume" in calls.columns else 0
-        total_put_vol = puts["volume"].sum() if "volume" in puts.columns else 0
-        total_call_vol = 0 if pd.isna(total_call_vol) else total_call_vol
-        total_put_vol = 0 if pd.isna(total_put_vol) else total_put_vol
-
-        if total_put_vol > 0:
-            pc_ratio = total_call_vol / total_put_vol
-        else:
-            pc_ratio = float("inf") if total_call_vol > 0 else 1.0
-
-        if pc_ratio > 3.0:
-            points += 8
-            notes_parts.append(f"Call/Put vol ratio {pc_ratio:.1f}")
-        elif pc_ratio > 1.5:
-            points += 5
-            notes_parts.append(f"Call/Put vol ratio {pc_ratio:.1f}")
-
-        # Unusual volume on OTM calls
-        if (
-            not calls.empty
-            and "volume" in calls.columns
-            and "openInterest" in calls.columns
-        ):
-            calls_clean = calls.dropna(subset=["volume", "openInterest"])
-            if not calls_clean.empty:
-                calls_clean = calls_clean[calls_clean["openInterest"] > 0]
-                if not calls_clean.empty:
-                    calls_clean = calls_clean.copy()
-                    calls_clean["vol_oi"] = (
-                        calls_clean["volume"] / calls_clean["openInterest"]
-                    )
-                    hot = calls_clean[calls_clean["vol_oi"] > 2.0]
-                    if len(hot) >= 3:
-                        points += 7
-                        notes_parts.append(f"{len(hot)} strikes with Vol/OI > 2")
-                    elif len(hot) >= 1:
-                        points += 4
-                        notes_parts.append(f"{len(hot)} strike(s) with Vol/OI > 2")
-
-        # Implied-volatility skew
-        if "impliedVolatility" in calls.columns:
-            avg_call_iv = calls["impliedVolatility"].mean()
-            avg_put_iv = (
-                puts["impliedVolatility"].mean()
-                if "impliedVolatility" in puts.columns
-                else avg_call_iv
-            )
-            if not (pd.isna(avg_call_iv) or pd.isna(avg_put_iv)):
-                skew = avg_put_iv - avg_call_iv
-                if skew > 0.10:
-                    points += 5
-                    notes_parts.append(f"IV skew (puts premium): {skew:.2f}")
-                elif skew > 0.03:
-                    points += 2
-                    notes_parts.append(f"Mild IV skew: {skew:.2f}")
-    except Exception as exc:
-        notes_parts.append(f"Options analysis error: {exc}")
-
-    result.options_score = min(points, 20)
-    result.options_notes = "; ".join(notes_parts) if notes_parts else "N/A"
-
-
-# --- 3C. Technical (30 pts) ------------------------------------------
-def _compute_rsi(series: pd.Series, period: int = 14) -> float:
-    """Single-value RSI for a close-price Series."""
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    last = rsi.iloc[-1]
-    return float(last) if not pd.isna(last) else 50.0
-
-
-def _compute_macd(close: pd.Series) -> Tuple[float, float]:
-    """Return (MACD line, signal line) last values."""
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    macd_line = ema12 - ema26
-    signal = macd_line.ewm(span=9, adjust=False).mean()
-    return float(macd_line.iloc[-1]), float(signal.iloc[-1])
-
-
-def score_technical(result: TickerResult, ticker_obj: yf.Ticker) -> None:
-    """Technical layer — up to 30 points."""
-    points = 0.0
-    notes_parts: list[str] = []
-
-    try:
-        hist = ticker_obj.history(period="6mo")
-        if hist.empty or len(hist) < 50:
-            result.technical_score = 0
-            result.technical_notes = "Insufficient price history"
-            return
-
-        close = hist["Close"]
-        last_price = close.iloc[-1]
-
-        # RSI (0-8 pts)
-        rsi = _compute_rsi(close)
-        if 40 <= rsi <= 65:
-            points += 8
-            notes_parts.append(f"RSI {rsi:.1f} (constructive zone)")
-        elif 30 <= rsi < 40:
-            points += 6
-            notes_parts.append(f"RSI {rsi:.1f} (nearing oversold)")
-        elif 65 < rsi <= 75:
-            points += 4
-            notes_parts.append(f"RSI {rsi:.1f} (strong momentum)")
-        else:
-            points += 1
-            notes_parts.append(f"RSI {rsi:.1f}")
-
-        # Moving Averages (0-10 pts)
-        sma20 = close.rolling(20).mean().iloc[-1]
-        sma50 = close.rolling(50).mean().iloc[-1]
-        ema9 = close.ewm(span=9, adjust=False).mean().iloc[-1]
-
-        above_count = sum([
-            last_price > sma20,
-            last_price > sma50,
-            last_price > ema9,
-            sma20 > sma50,
-        ])
-        ma_pts = min(above_count * 2.5, 10)
-        points += ma_pts
-        notes_parts.append(
-            f"Above {above_count}/3 MAs, SMA20{'>' if sma20 > sma50 else '<'}SMA50"
-        )
-
-        # MACD (0-6 pts)
-        macd_val, signal_val = _compute_macd(close)
-        if macd_val > signal_val and macd_val > 0:
-            points += 6
-            notes_parts.append("MACD bullish crossover (above zero)")
-        elif macd_val > signal_val:
-            points += 4
-            notes_parts.append("MACD bullish crossover (below zero)")
-        elif macd_val > 0:
-            points += 2
-            notes_parts.append("MACD positive but weakening")
-
-        # 5-day momentum (0-6 pts)
-        if len(close) >= 6:
-            mom_5d = (close.iloc[-1] / close.iloc[-6] - 1) * 100
-            if 1 <= mom_5d <= 8:
-                points += 6
-                notes_parts.append(f"5d momentum +{mom_5d:.1f}%")
-            elif 0 < mom_5d < 1:
-                points += 3
-                notes_parts.append(f"5d momentum +{mom_5d:.1f}%")
-            elif mom_5d > 8:
-                points += 2
-                notes_parts.append(f"5d momentum +{mom_5d:.1f}% (extended)")
-            else:
-                notes_parts.append(f"5d momentum {mom_5d:.1f}%")
-
-    except Exception as exc:
-        notes_parts.append(f"Technical analysis error: {exc}")
-
-    result.technical_score = min(points, 30)
-    result.technical_notes = "; ".join(notes_parts) if notes_parts else "N/A"
-
-
-# --- 3D. News / Sentiment (15 pts) -----------------------------------
-_POS_WORDS = {
-    "beat", "beats", "surpass", "upgrade", "bullish", "outperform",
-    "record", "growth", "strong", "positive", "boost", "surge",
-    "raises", "raise", "expand", "innovative", "win", "award",
-    "partnership", "launch", "approval", "profit", "upside",
-}
-_NEG_WORDS = {
-    "miss", "downgrade", "bearish", "underperform", "decline",
-    "loss", "weak", "negative", "cut", "recall", "lawsuit",
-    "layoff", "investigation", "fraud", "debt", "warning",
-    "concern", "risk", "downturn", "falling", "crash",
-}
-
-
-def _simple_sentiment(text: str) -> float:
-    """Return a score in [-1, 1] based on keyword frequency."""
-    words = set(re.findall(r"[a-z]+", text.lower()))
-    pos = len(words & _POS_WORDS)
-    neg = len(words & _NEG_WORDS)
-    total = pos + neg
-    if total == 0:
-        return 0.0
-    return (pos - neg) / total
-
-
-def score_news(result: TickerResult, ticker_obj: yf.Ticker) -> None:
-    """News sentiment layer — up to 15 points."""
-    points = 0.0
-    notes_parts: list[str] = []
-
-    try:
-        news_items = ticker_obj.news or []
-        if not news_items:
-            result.news_score = 0
-            result.news_notes = "No recent news found"
-            return
-
-        sentiments: list[float] = []
-        for item in news_items[:15]:
-            title = (
-                item.get("title")
-                or item.get("content", {}).get("title", "")
-            )
-            snippet = (
-                item.get("summary")
-                or item.get("content", {}).get("summary", "")
-            )
-            text = f"{title} {snippet}"
-            sentiments.append(_simple_sentiment(text))
-
-        if sentiments:
-            avg_sent = statistics.mean(sentiments)
-            positive_ratio = sum(1 for s in sentiments if s > 0) / len(sentiments)
-
-            if avg_sent > 0.3:
-                points += 10
-                notes_parts.append(f"Strongly positive news ({avg_sent:+.2f})")
-            elif avg_sent > 0.1:
-                points += 7
-                notes_parts.append(f"Positive news ({avg_sent:+.2f})")
-            elif avg_sent > -0.1:
-                points += 4
-                notes_parts.append(f"Neutral news ({avg_sent:+.2f})")
-            else:
-                points += 0
-                notes_parts.append(f"Negative news ({avg_sent:+.2f})")
-
-            if positive_ratio >= 0.7:
-                points += 5
-                notes_parts.append(f"{positive_ratio:.0%} headlines positive")
-        else:
-            notes_parts.append("Could not parse news sentiment")
-
-    except Exception as exc:
-        notes_parts.append(f"News analysis error: {exc}")
-
-    result.news_score = min(points, 15)
-    result.news_notes = "; ".join(notes_parts) if notes_parts else "N/A"
-
-
-# --- 3E. Fundamentals (10 pts) ---------------------------------------
-def score_fundamentals(result: TickerResult, ticker_obj: yf.Ticker) -> None:
-    """Fundamentals layer — up to 10 points."""
-    points = 0.0
-    notes_parts: list[str] = []
-
-    try:
-        info = ticker_obj.info or {}
-
-        # Market cap (0-3 pts)
-        mcap = info.get("marketCap", 0) or 0
-        if mcap >= 100e9:
-            points += 3
-            notes_parts.append("Mega-cap")
-        elif mcap >= 10e9:
-            points += 2
-            notes_parts.append("Large-cap")
-        elif mcap >= 2e9:
-            points += 1
-            notes_parts.append("Mid-cap")
-        else:
-            notes_parts.append("Small-cap")
-
-        result.market_cap = (
-            f"${mcap / 1e9:.1f}B" if mcap >= 1e9 else f"${mcap / 1e6:.0f}M"
-        ) if mcap else "N/A"
-
-        # Volume vs average (0-4 pts)
-        vol = info.get("volume", 0) or 0
-        avg_vol = info.get("averageVolume", 1) or 1
-        result.volume = vol
-        result.avg_volume = avg_vol
-        rel_vol = vol / avg_vol if avg_vol else 1
-        if rel_vol >= 2.0:
-            points += 4
-            notes_parts.append(f"Rel vol {rel_vol:.1f}x")
-        elif rel_vol >= 1.3:
-            points += 2
-            notes_parts.append(f"Rel vol {rel_vol:.1f}x")
-        else:
-            notes_parts.append(f"Rel vol {rel_vol:.1f}x")
-
-        # Debt / Equity (0-3 pts)
-        de = info.get("debtToEquity")
-        if de is not None:
-            de_val = float(de)
-            if de_val < 50:
-                points += 3
-                notes_parts.append(f"D/E {de_val:.0f}%")
-            elif de_val < 100:
-                points += 2
-                notes_parts.append(f"D/E {de_val:.0f}%")
-            elif de_val < 200:
-                points += 1
-                notes_parts.append(f"D/E {de_val:.0f}%")
-            else:
-                notes_parts.append(f"D/E {de_val:.0f}% (high)")
-        else:
-            notes_parts.append("D/E N/A")
-
-        result.company = (
-            info.get("shortName") or info.get("longName") or result.symbol
-        )
-        result.sector = info.get("sector", "N/A")
-        result.price = (
-            info.get("currentPrice") or info.get("regularMarketPrice") or 0
-        )
-
-    except Exception as exc:
-        notes_parts.append(f"Fundamentals error: {exc}")
-
-    result.fundamentals_score = min(points, 10)
-    result.fundamentals_notes = (
-        "; ".join(notes_parts) if notes_parts else "N/A"
-    )
-
-
-# ======================================================================
-# Analyse single ticker (all 5 layers)
-# ======================================================================
 def analyse_ticker(symbol: str) -> TickerResult:
-    """Run full 5-layer analysis on a single ticker."""
-    result = TickerResult(symbol=symbol)
+    """Full multi-factor analysis on a single ticker."""
+    res = TickerResult(symbol=symbol)
     try:
-        ticker_obj = yf.Ticker(symbol)
-        score_fundamentals(result, ticker_obj)
-        score_technical(result, ticker_obj)
-        score_catalyst(result, ticker_obj)
-        score_options(result, ticker_obj)
-        score_news(result, ticker_obj)
+        t = yf.Ticker(symbol)
+        info = t.info or {}
+        hist = t.history(period="6mo", interval="1d")
+        if hist.empty:
+            res.error = "No history"
+            return res
+
+        res.price = float(info.get("currentPrice") or info.get("regularMarketPrice")
+                          or hist["Close"].iloc[-1])
+        prev = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else res.price
+        res.change_pct = round((res.price / prev - 1) * 100, 2) if prev else 0
+        res.volume = int(info.get("volume") or info.get("regularMarketVolume") or 0)
+        res.avg_volume = int(info.get("averageVolume") or 0)
+        res.market_cap = float(info.get("marketCap") or 0)
+        res.sector = info.get("sector") or ""
+
+        # scores
+        res.technical_score, tn = score_technical(hist, info)
+        res.notes.extend(tn)
+        res.fundamental_score, fn = score_fundamentals(info)
+        res.notes.extend(fn)
+        res.options_score, on = score_options(info)
+        res.notes.extend(on)
+        res.catalyst_score, cn = score_catalyst(info)
+        res.notes.extend(cn)
+        res.news_score, nn = score_news(symbol)
+        res.notes.extend(nn)
+
+        res.total_score = (res.technical_score + res.fundamental_score
+                           + res.options_score + res.catalyst_score
+                           + res.news_score)
+    except TickerTimeout:
+        res.error = "Timed out"
     except Exception as exc:
-        log.error("Fatal error analysing %s: %s", symbol, exc)
-    return result
+        res.error = str(exc)[:120]
+    return res
 
 
-def deep_dive(
-    tickers: List[str], top_n: int = DEEP_DIVE_COUNT
-) -> List[TickerResult]:
-    """Analyse *top_n* tickers through the full 5-layer pipeline."""
-    subset = tickers[:top_n]
-    log.info(
-        "Phase 3 — Full 5-layer deep dive on %d tickers ...", len(subset)
-    )
-
-    results: list[TickerResult] = []
-    for i, sym in enumerate(subset, 1):
-        if _timeout_reached():
-            log.warning(
-                "  Global timeout reached at ticker %d/%d — stopping deep dive.",
-                i, len(subset),
-            )
-            break
-        log.info("  [%d/%d] Analysing %s ...", i, len(subset), sym)
-        res = analyse_ticker(sym)
-        results.append(res)
-        time.sleep(REQUEST_DELAY)
-
+def deep_dive(candidates: List[Tuple[str, float, float, int]],
+              count: int = DEEP_DIVE_COUNT) -> List[TickerResult]:
+    """Run full analysis on the top Phase-1 survivors."""
+    log.info("Phase-2: deep-diving %d candidates", min(len(candidates), count))
+    results: List[TickerResult] = []
+    for i, (sym, price, chg, vol) in enumerate(candidates[:count]):
+        log.info("  [%d/%d] %s ($%.2f, %+.1f%%)",
+                 i + 1, min(len(candidates), count), sym, price, chg)
+        # timeout protection
+        try:
+            if hasattr(signal, "SIGALRM"):
+                old = signal.signal(signal.SIGALRM, _timeout_handler)
+                signal.alarm(TICKER_TIMEOUT_SEC)
+            r = analyse_ticker(sym)
+            if hasattr(signal, "SIGALRM"):
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old)
+        except TickerTimeout:
+            r = TickerResult(symbol=sym, error="Timed out")
+            if hasattr(signal, "SIGALRM"):
+                signal.alarm(0)
+        except Exception as exc:
+            r = TickerResult(symbol=sym, error=str(exc)[:120])
+        results.append(r)
     results.sort(key=lambda r: r.total_score, reverse=True)
     return results
 
 
-# ======================================================================
-# 4. Reporting
-# ======================================================================
-def print_header(text: str) -> None:
-    width = 76
-    print("\n" + "=" * width)
-    print(f" {text}".center(width))
-    print("=" * width)
+# =====================================================================
+#  REPORTING
+# =====================================================================
+
+def print_report(results: List[TickerResult], regime: Dict[str, Any]):
+    """Pretty-print ranked results to stdout."""
+    print("\n" + "=" * 80)
+    print("  US MULTI-EXCHANGE STOCK SCREENER  ".center(80, "="))
+    print("=" * 80)
+    print(f"  Run: {dt.datetime.now():%Y-%m-%d %H:%M}   "
+          f"Regime: {regime.get('trend', '?').upper()}   "
+          f"VIX-proxy: {regime.get('vix_proxy', '?')}%")
+    print(f"  SPY>200d: {regime.get('spy_above_200d')}   "
+          f"SPY>50d: {regime.get('spy_above_50d')}")
+    print("=" * 80)
+
+    ranked = [r for r in results if not r.error]
+    errors = [r for r in results if r.error]
+
+    if not ranked:
+        print("\n  No valid results.\n")
+        return
+
+    print(f"\n  TOP {min(30, len(ranked))} PICKS")
+    print("-" * 80)
+    fmt = "  {rank:>3}. {sym:<6} ${price:>8.2f} ({chg:>+6.1f}%)  "
+    fmt += "T:{t:>4.0f} F:{f:>4.0f} O:{o:>4.0f} C:{c:>4.0f} N:{n:>4.0f} "
+    fmt += "= {total:>5.0f}  {sector}"
+
+    for i, r in enumerate(ranked[:30], 1):
+        print(fmt.format(
+            rank=i, sym=r.symbol, price=r.price, chg=r.change_pct,
+            t=r.technical_score, f=r.fundamental_score,
+            o=r.options_score, c=r.catalyst_score, n=r.news_score,
+            total=r.total_score, sector=r.sector[:18],
+        ))
+        if r.notes:
+            # print top 5 notes
+            top_notes = [n for n in r.notes if not n.startswith("News")][:5]
+            if top_notes:
+                print(f"       └ {' | '.join(top_notes)}")
+
+    if errors:
+        print(f"\n  ({len(errors)} tickers had errors)")
+
+    print("\n" + "=" * 80)
 
 
-def print_report(
-    results: List[TickerResult],
-    regime_msg: str,
-    total_universe: int,
-    phase1_survivors: int,
-    final_n: int = FINAL_TOP_N,
-) -> None:
-    """Print the final scored report to stdout."""
-    print_header("NYSE FULL-UNIVERSE MULTI-FACTOR STOCK SCREENER")
-    print(f"  Run date    : {dt.datetime.now():%Y-%m-%d %H:%M:%S}")
-    print(f"  Horizon     : 3-day analytical window")
-    print(f"  Universe    : {total_universe:,} NYSE tickers fetched")
-    print(f"  Phase 1     : -> {phase1_survivors:,} survivors (fast filter)")
-    print(f"  Phase 2     : -> {len(results):,} fully analysed")
-    print(f"  Runtime     : {_elapsed():.0f}s ({_elapsed()/60:.1f} min)")
-    print(f"\n  Market Regime: {regime_msg}")
-
-    print_header(f"TOP {final_n} CANDIDATES")
-
-    top = results[:final_n]
-    for rank, r in enumerate(top, 1):
-        divider = "-" * 30
-        print(f"\n  -- #{rank}  {r.symbol}  ({r.company}) {divider}")
-        print(
-            f"  Price: ${r.price:,.2f}   Mkt Cap: {r.market_cap}   Sector: {r.sector}"
-        )
-        print(f"  +------------------------+--------+")
-        print(f"  |  Layer                 | Score  |")
-        print(f"  +------------------------+--------+")
-        print(
-            f"  |  Catalyst   (max 25)   | {r.catalyst_score:5.1f}  |  {r.catalyst_notes}"
-        )
-        print(
-            f"  |  Options    (max 20)   | {r.options_score:5.1f}  |  {r.options_notes}"
-        )
-        print(
-            f"  |  Technical  (max 30)   | {r.technical_score:5.1f}  |  {r.technical_notes}"
-        )
-        print(
-            f"  |  News       (max 15)   | {r.news_score:5.1f}  |  {r.news_notes}"
-        )
-        print(
-            f"  |  Fundamental(max 10)   | {r.fundamentals_score:5.1f}  |  {r.fundamentals_notes}"
-        )
-        print(f"  +------------------------+--------+")
-        print(
-            f"  |  TOTAL      (max 100)  | {r.total_score:5.1f}  |"
-        )
-        print(f"  +------------------------+--------+")
-
-    # Full rankings table
-    print_header("FULL RANKINGS (all analysed tickers)")
-    print(
-        f"  {'Rank':<5} {'Ticker':<8} {'Total':>6}  "
-        f"{'Cat':>4} {'Opt':>4} {'Tech':>4} {'News':>4} {'Fund':>4}  Company"
-    )
-    print(
-        f"  {'-'*5} {'-'*8} {'-'*6}  "
-        f"{'-'*4} {'-'*4} {'-'*4} {'-'*4} {'-'*4}  {'-'*20}"
-    )
-    for i, r in enumerate(results, 1):
-        print(
-            f"  {i:<5} {r.symbol:<8} {r.total_score:6.1f}  "
-            f"{r.catalyst_score:4.1f} {r.options_score:4.1f} "
-            f"{r.technical_score:4.1f} {r.news_score:4.1f} "
-            f"{r.fundamentals_score:4.1f}  {r.company[:28]}"
-        )
-
-    print("\n" + "=" * 76)
-    print("  DISCLAIMER: This output is for EDUCATIONAL and RESEARCH purposes")
-    print("  only. It is NOT financial advice. Always perform your own analysis")
-    print("  and consult a licensed professional before making decisions.")
-    print("=" * 76 + "\n")
+def write_csv(results: List[TickerResult], path: str):
+    """Write results to CSV."""
+    fieldnames = [
+        "rank", "symbol", "price", "change_pct", "volume", "avg_volume",
+        "market_cap", "sector", "tech", "fund", "opts", "catalyst", "news",
+        "total", "notes",
+    ]
+    ranked = [r for r in results if not r.error]
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for i, r in enumerate(ranked, 1):
+            w.writerow({
+                "rank": i,
+                "symbol": r.symbol,
+                "price": r.price,
+                "change_pct": r.change_pct,
+                "volume": r.volume,
+                "avg_volume": r.avg_volume,
+                "market_cap": r.market_cap,
+                "sector": r.sector,
+                "tech": r.technical_score,
+                "fund": r.fundamental_score,
+                "opts": r.options_score,
+                "catalyst": r.catalyst_score,
+                "news": r.news_score,
+                "total": r.total_score,
+                "notes": " | ".join(r.notes[:8]),
+            })
+    log.info("CSV written to %s (%d rows)", path, len(ranked))
 
 
-# ======================================================================
-# 5. CLI Argument Parsing
-# ======================================================================
-def parse_args() -> argparse.Namespace:
+# =====================================================================
+#  MAIN
+# =====================================================================
+
+def main():
     parser = argparse.ArgumentParser(
-        description="NYSE Full-Universe Multi-Factor Stock Screener (educational)",
-    )
-    parser.add_argument(
-        "--quick",
-        action="store_true",
-        help=(
-            f"Quick mode: cap universe at {QUICK_UNIVERSE_CAP} tickers "
-            "and reduce Phase 2 pool (useful for testing)."
-        ),
-    )
-    parser.add_argument(
-        "--top",
-        type=int,
-        default=FINAL_TOP_N,
-        help=f"Number of top candidates to display (default {FINAL_TOP_N}).",
-    )
-    parser.add_argument(
-        "--phase1-top",
-        type=int,
-        default=PHASE1_TOP_N,
-        help=f"Phase 1 survivors forwarded to deep dive (default {PHASE1_TOP_N}).",
-    )
-    return parser.parse_args()
+        description="Full-Universe US Market Multi-Factor Stock Screener")
+    parser.add_argument("--quick", action="store_true",
+                        help=f"Fast mode: cap universe at {QUICK_UNIVERSE_CAP}")
+    parser.add_argument("--csv", type=str, default="",
+                        help="Output CSV path")
+    args = parser.parse_args()
 
+    log.info("=" * 60)
+    log.info("US MULTI-EXCHANGE STOCK SCREENER starting")
+    log.info("Exchanges: NYSE · NASDAQ · AMEX · ARCA · BATS")
+    log.info("=" * 60)
 
-# ======================================================================
-# Main
-# ======================================================================
-def main() -> None:
-    global _GLOBAL_START
-    _GLOBAL_START = time.time()
+    # 1. Market regime
+    regime = check_market_regime()
+    log.info("Market regime: %s  (VIX-proxy %.1f%%)",
+             regime["trend"], regime.get("vix_proxy") or 0)
 
-    args = parse_args()
-    final_n = args.top
-    phase1_top = args.phase1_top
+    # 2. Fetch universe
+    tickers = fetch_all_us_tickers()
+    log.info("Universe: %d tickers", len(tickers))
 
     if args.quick:
-        log.info(
-            "Quick mode enabled — capping universe at %d tickers.",
-            QUICK_UNIVERSE_CAP,
-        )
-        phase1_top = min(phase1_top, 50)
+        tickers = tickers[:QUICK_UNIVERSE_CAP]
+        log.info("--quick mode: capped to %d tickers", len(tickers))
 
-    # -- Phase 0: Market Regime Gate -----------------------------------
-    regime_ok, regime_msg = check_market_regime()
-    print(f"\n{'-' * 76}")
-    print(f"  {regime_msg}")
-    print(f"{'-' * 76}\n")
-    if not regime_ok:
-        log.warning(
-            "Adverse regime — results should be interpreted with extra caution."
-        )
+    # 3. Phase 1 — bulk filter
+    survivors = phase1_bulk_filter(tickers, top_n=PHASE1_TOP_N)
 
-    # -- Phase 1: Fetch ALL NYSE tickers -------------------------------
-    universe = fetch_all_nyse_tickers()
-    total_universe = len(universe)
+    # 4. Phase 2 — deep dive
+    results = deep_dive(survivors, count=DEEP_DIVE_COUNT)
 
-    if args.quick:
-        universe = universe[:QUICK_UNIVERSE_CAP]
-        log.info("Quick mode: trimmed universe to %d tickers.", len(universe))
+    # 5. Report
+    print_report(results, regime)
+    if args.csv:
+        write_csv(results, args.csv)
 
-    if not universe:
-        log.error("No tickers collected — cannot proceed.")
-        sys.exit(1)
-
-    # -- Phase 2: Fast bulk filter -> top N survivors -------------------
-    survivors = phase1_bulk_filter(universe, top_n=phase1_top)
-    phase1_survivors = len(survivors)
-
-    if not survivors:
-        log.error("Phase 1 produced 0 survivors — cannot proceed.")
-        sys.exit(1)
-
-    # -- Phase 3: Full 5-layer deep dive --------------------------------
-    results = deep_dive(survivors, top_n=len(survivors))
-
-    if not results:
-        log.error("Deep dive produced 0 results — cannot proceed.")
-        sys.exit(1)
-
-    # -- Phase 4: Report ------------------------------------------------
-    print_report(
-        results,
-        regime_msg,
-        total_universe=total_universe,
-        phase1_survivors=phase1_survivors,
-        final_n=final_n,
-    )
-
-    log.info(
-        "Screening completed in %.1f seconds (%.1f min).",
-        _elapsed(), _elapsed() / 60,
-    )
+    log.info("Done.")
 
 
 if __name__ == "__main__":
