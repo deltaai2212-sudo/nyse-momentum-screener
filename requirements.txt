@@ -1,6 +1,6 @@
 yfinance
 pandas
-pandas-ta
+pandas_ta
 requests
 beautifulsoup4
 finvizfinance
