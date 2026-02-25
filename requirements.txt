@@ -1,0 +1,9 @@
+yfinance
+pandas
+pandas-ta
+requests
+beautifulsoup4
+finvizfinance
+tabulate
+colorama
+python-dateutil
