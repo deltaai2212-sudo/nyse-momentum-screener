@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Full-Universe US Market Multi-Factor Stock Screener
-====================================================
+Full-Universe US Market Multi-Factor PREDICTIVE Stock Screener
+===============================================================
 Scans NYSE + NASDAQ + AMEX + ARCA + BATS — targeting 10,000-15,000+
 tradeable US securities — through a multi-phase funnel:
 
-  Phase 1  – Bulk yfinance download for fast momentum / volume filter
+  Phase 1  – Bulk yfinance download for fast pre-move / coiling filter
   Phase 2  – Deep-dive analysis on top candidates (technicals,
              fundamentals, options flow, catalysts, news sentiment)
+
+PREDICTIVE PHILOSOPHY: This screener finds stocks that WILL move in
+the next 1-2 days, NOT stocks that already moved today. It rewards
+compression, coiling, volume dry-up, and upcoming catalysts.
 
 Architecture
 ------------
@@ -86,18 +90,26 @@ OPT_CAP = 20
 CAT_CAP = 25
 NEWS_CAP = 15
 
-# ── Keyword sets for news scoring ───────────────────────────────────
+# ── Keyword sets for news scoring (UPDATED for predictive signals) ──
 _POS_WORDS = {
     "upgrade", "beat", "raise", "buy", "outperform", "bullish",
-    "record", "surge", "high", "growth", "exceed", "positive",
-    "strong", "upside", "breakout", "momentum", "rally", "soar",
-    "spike", "explode", "moon", "short", "squeeze",
+    "record", "high", "growth", "exceed", "positive",
+    "strong", "upside", "breakout", "momentum", "rally",
+    "short", "squeeze",
+    # NEW forward-looking catalyst words
+    "upcoming", "catalyst", "potential", "setup", "accumulate",
+    "undervalued", "target", "initiate", "coverage", "launch",
+    "fda", "approval", "contract", "partnership", "buyback",
 }
+# REMOVED from _POS_WORDS: 'surge', 'spike', 'soar', 'moon', 'explode'
+
 _NEG_WORDS = {
     "downgrade", "miss", "cut", "sell", "underperform", "bearish",
     "low", "decline", "negative", "weak", "downside", "warning",
-    "risk", "loss", "dilution", "offering", "reverse", "split",
-    "delist", "bankruptcy", "halt",
+    "risk", "loss",
+    # NEW negative words
+    "dilution", "offering", "reverse", "split", "delist",
+    "bankruptcy", "halt", "investigation", "lawsuit", "fraud",
 }
 
 # ── TickerResult dataclass ──────────────────────────────────────────
@@ -427,17 +439,22 @@ def check_market_regime() -> Dict[str, Any]:
 
 
 # =====================================================================
-#  PHASE 1 – BULK FILTER
+#  PHASE 1 – BULK FILTER (PREDICTIVE: favours NOT-YET-MOVED stocks)
 # =====================================================================
 
 def phase1_bulk_filter(tickers: List[str], top_n: int = PHASE1_TOP_N,
                        ) -> List[Tuple[str, float, float, int]]:
     """
-    Fast screen: download daily bars for all tickers in batches,
-    rank by a simple momentum × relative-volume composite.
-    Returns list of (symbol, last_close, change_pct, volume) sorted desc.
+    PREDICTIVE fast screen: download daily bars for all tickers in batches,
+    filter for stocks that are COILING / SETTING UP (not already moved).
+    Rejects stocks already up >5% today. Favours compression + moderate
+    volume + RSI in the sweet spot.
+
+    Returns list of (symbol, last_close, change_pct, volume) sorted by
+    setup-quality composite descending.
     """
-    log.info("Phase-1: bulk-filtering %d tickers (top %d)", len(tickers), top_n)
+    log.info("Phase-1: bulk-filtering %d tickers (top %d) — PREDICTIVE mode",
+             len(tickers), top_n)
     results: List[Tuple[str, float, float, float, int]] = []
 
     for i in range(0, len(tickers), YF_GROUP_SIZE):
@@ -464,27 +481,76 @@ def phase1_bulk_filter(tickers: List[str], top_n: int = PHASE1_TOP_N,
                 if sub is None or sub.empty:
                     continue
                 sub = sub.dropna(subset=["Close"])
-                if len(sub) < 10:
+                if len(sub) < 20:
                     continue
                 close = sub["Close"]
                 vol = sub["Volume"]
                 last_close = float(close.iloc[-1])
                 if last_close < 1.0:
                     continue  # penny stocks
-                pct_5d = float((close.iloc[-1] / close.iloc[-6] - 1) * 100) if len(close) >= 6 else 0.0
+
+                # ── Today's change: REJECT if already moved big ──
+                prev_close = float(close.iloc[-2]) if len(close) >= 2 else last_close
+                change_pct = ((last_close / prev_close) - 1) * 100 if prev_close > 0 else 0.0
+                if abs(change_pct) > 5.0:
+                    continue  # already ran today — skip
+
                 avg_vol = float(vol.tail(20).mean()) if len(vol) >= 20 else float(vol.mean())
                 last_vol = float(vol.iloc[-1])
                 if avg_vol < 50_000:
                     continue  # illiquid
+
+                # ── Volume filter: some activity but not exploding ──
+                if last_vol < 0.8 * avg_vol:
+                    # Allow only if volume is drying up (accumulation signal)
+                    # but reject truly dead tickers with < 30% avg vol
+                    if last_vol < 0.3 * avg_vol:
+                        continue
+
+                # ── Quick RSI estimate (14-period) ──
+                if len(close) >= 15:
+                    delta = close.diff()
+                    gain = delta.clip(lower=0).rolling(14).mean().iloc[-1]
+                    loss_val = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
+                    if loss_val != 0:
+                        rs = gain / loss_val
+                        rsi_est = 100 - 100 / (1 + rs)
+                    else:
+                        rsi_est = 100.0
+                else:
+                    rsi_est = 50.0  # default neutral
+
+                if rsi_est < 35 or rsi_est > 68:
+                    continue  # overbought or oversold — skip
+
+                # ── Composite: reward compression + vol dry-up + RSI sweet spot ──
+                # Bollinger Band Width proxy (lower = more compressed)
+                if len(close) >= 20:
+                    sma20 = float(close.rolling(20).mean().iloc[-1])
+                    std20 = float(close.rolling(20).std().iloc[-1])
+                    bbw = (std20 / sma20) if sma20 > 0 else 1.0
+                else:
+                    bbw = 0.05  # default moderate
+
+                # Compression score: lower BBW = better (invert it)
+                compression_score = max(0, (0.10 - bbw) * 100)  # 0-10 range roughly
+
+                # Vol dry-up score: ratio of recent vol to avg (lower = accumulation)
                 rel_vol = last_vol / avg_vol if avg_vol > 0 else 1.0
-                composite = pct_5d * 0.6 + (rel_vol - 1) * 40 * 0.4
-                results.append((sym, last_close, pct_5d, composite, int(last_vol)))
+                vol_dryup_score = max(0, (1.0 - rel_vol) * 10)  # lower vol = higher score
+
+                # RSI sweet spot score: peak at 52.5
+                rsi_score = max(0, 5 - abs(rsi_est - 52.5) / 5)
+
+                composite = compression_score * 0.4 + vol_dryup_score * 0.3 + rsi_score * 0.3
+
+                results.append((sym, last_close, change_pct, composite, int(last_vol)))
             except Exception:
                 continue
 
     results.sort(key=lambda x: x[3], reverse=True)
     top = results[:top_n]
-    log.info("Phase-1 done: %d passed liquidity filter, returning top %d",
+    log.info("Phase-1 done: %d passed predictive filter, returning top %d",
              len(results), len(top))
     return [(s, p, c, v) for s, p, c, _, v in top]
 
@@ -495,8 +561,10 @@ def phase1_bulk_filter(tickers: List[str], top_n: int = PHASE1_TOP_N,
 
 def score_technical(hist: pd.DataFrame, info: dict) -> Tuple[float, List[str]]:
     """
-    Technical scoring: trend, RSI, MACD, Bollinger position,
-    plus gap-up and volume-surge detection.  Cap = 30.
+    PREDICTIVE Technical scoring — Cap = 30.
+    Rewards PRE-MOVE signals: compression/coiling, RSI sweet spot,
+    volume drying up, MACD about-to-cross, near key support.
+    PENALISES already-moved / overbought stocks.
     """
     pts = 0.0
     notes: List[str] = []
@@ -509,91 +577,157 @@ def score_technical(hist: pd.DataFrame, info: dict) -> Tuple[float, List[str]]:
     volume = hist["Volume"]
     last = float(close.iloc[-1])
 
-    # ── Moving-average trend ──
+    # ================================================================
+    # A) COMPRESSION / COILING (base-building, NOT already broken out)
+    # ================================================================
+
+    # A1: Bollinger Band Width in bottom 20th percentile of its own 50-day range
     if len(close) >= 50:
-        ma50 = float(close.rolling(50).mean().iloc[-1])
-        if last > ma50:
-            pts += 4
-            notes.append(f"Above MA50 ({ma50:.2f})")
-        else:
-            pts -= 2
+        sma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std()
+        bbw = std20 / sma20  # Bollinger Band Width as ratio
+        bbw_clean = bbw.dropna()
+        if len(bbw_clean) >= 50:
+            current_bbw = float(bbw_clean.iloc[-1])
+            pctile = float((bbw_clean.tail(50) < current_bbw).mean() * 100)
+            if pctile <= 20:
+                pts += 5
+                notes.append("BB squeeze - coiling")
+    elif len(close) >= 20:
+        sma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std()
+        bbw = std20 / sma20
+        bbw_clean = bbw.dropna()
+        if len(bbw_clean) >= 20:
+            current_bbw = float(bbw_clean.iloc[-1])
+            pctile = float((bbw_clean < current_bbw).mean() * 100)
+            if pctile <= 20:
+                pts += 5
+                notes.append("BB squeeze - coiling")
+
+    # A2: Price within 2% of 20-day moving average (tight range, calm)
     if len(close) >= 20:
         ma20 = float(close.rolling(20).mean().iloc[-1])
-        if last > ma20:
-            pts += 3
+        if ma20 > 0:
+            dist_to_ma20 = abs(last - ma20) / ma20
+            if dist_to_ma20 <= 0.02:
+                pts += 3
+                notes.append("Price coiling near MA20")
 
-    # ── RSI(14) ──
+    # ================================================================
+    # B) RSI SWEET SPOT (not overbought, has room to run)
+    # ================================================================
+    rsi = None
     if len(close) >= 15:
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rs = gain.iloc[-1] / loss.iloc[-1] if loss.iloc[-1] != 0 else 100
-        rsi = 100 - 100 / (1 + rs)
-        if 50 < rsi < 70:
-            pts += 4
-            notes.append(f"RSI {rsi:.0f} bullish")
-        elif 30 < rsi <= 50:
-            pts += 1
-        elif rsi >= 70:
-            pts += 1
-            notes.append(f"RSI {rsi:.0f} overbought")
+        loss_s = (-delta.clip(upper=0)).rolling(14).mean()
+        if float(loss_s.iloc[-1]) != 0:
+            rs = float(gain.iloc[-1]) / float(loss_s.iloc[-1])
+            rsi = 100 - 100 / (1 + rs)
         else:
-            pts -= 1
-            notes.append(f"RSI {rsi:.0f} oversold")
+            rsi = 100.0
 
-    # ── MACD ──
-    if len(close) >= 26:
+        if 45 <= rsi <= 60:
+            pts += 6
+            notes.append(f"RSI primed {rsi:.0f} (room to run)")
+        elif 40 <= rsi < 45:
+            pts += 3
+            notes.append(f"RSI recovering {rsi:.0f}")
+        elif rsi > 70:
+            pts -= 5
+            notes.append(f"RSI overbought {rsi:.0f} - already ran")
+        elif rsi < 35:
+            pts -= 3
+            notes.append(f"RSI oversold {rsi:.0f} - risky")
+
+    # ================================================================
+    # C) VOLUME DRYING UP (institutions quietly accumulating)
+    # ================================================================
+    if len(volume) >= 23:
+        avg_vol_20 = float(volume.tail(23).iloc[:-3].mean())  # 20-day avg excl last 3
+        last_3_avg = float(volume.tail(3).mean())
+
+        # C1: Last 3 days avg volume < 60% of 20-day avg
+        if avg_vol_20 > 0 and last_3_avg < 0.6 * avg_vol_20:
+            pts += 4
+            notes.append("Volume drying up - accumulation")
+
+        # C2: Volume declining 3 consecutive days while price flat/up
+        if len(volume) >= 4 and len(close) >= 4:
+            v1 = float(volume.iloc[-3])
+            v2 = float(volume.iloc[-2])
+            v3 = float(volume.iloc[-1])
+            p1 = float(close.iloc[-4])  # price before the 3-day period
+            p3 = float(close.iloc[-1])  # price at end
+            if v1 > v2 > v3 and p3 >= p1 * 0.99:  # vol declining, price flat/up
+                pts += 3
+                notes.append("Vol contraction with price hold")
+
+    # ================================================================
+    # D) MACD SETUP (about to cross, not already crossed)
+    # ================================================================
+    if len(close) >= 35:
         ema12 = close.ewm(span=12).mean()
         ema26 = close.ewm(span=26).mean()
-        macd = ema12 - ema26
-        sig = macd.ewm(span=9).mean()
-        if float(macd.iloc[-1]) > float(sig.iloc[-1]):
+        macd_line = ema12 - ema26
+        signal_line = macd_line.ewm(span=9).mean()
+        histogram = macd_line - signal_line
+
+        macd_val = float(macd_line.iloc[-1])
+        sig_val = float(signal_line.iloc[-1])
+        gap = macd_val - sig_val
+
+        # D1: MACD below signal but about to cross (gap < 0.5% of price)
+        if gap < 0 and last > 0 and abs(gap) < 0.005 * last:
             pts += 4
-            notes.append("MACD bullish cross")
-        else:
-            pts -= 1
+            notes.append("MACD about to cross bullish")
 
-    # ── Bollinger Band position ──
-    if len(close) >= 20:
-        sma20 = close.rolling(20).mean()
-        std20 = close.rolling(20).std()
-        upper = float(sma20.iloc[-1] + 2 * std20.iloc[-1])
-        lower = float(sma20.iloc[-1] - 2 * std20.iloc[-1])
-        band_range = upper - lower
-        if band_range > 0:
-            position = (last - lower) / band_range
-            if 0.5 < position < 0.85:
+        # D2: MACD histogram turning less negative for 3 days in a row
+        if len(histogram) >= 4:
+            h1 = float(histogram.iloc[-3])
+            h2 = float(histogram.iloc[-2])
+            h3 = float(histogram.iloc[-1])
+            if h1 < h2 < h3 and h3 < 0:
                 pts += 3
-                notes.append(f"BB position {position:.0%}")
-            elif position >= 0.85:
-                pts += 1
-                notes.append(f"BB near upper {position:.0%}")
+                notes.append("MACD momentum building")
 
-    # ── NEW: Gap-up detection ──
-    if len(hist) >= 2:
-        yesterday_close = float(close.iloc[-2])
-        today_open = float(hist["Open"].iloc[-1])
-        if yesterday_close > 0 and today_open > yesterday_close * 1.005:
-            gap_pct = (today_open / yesterday_close - 1) * 100
-            pts += 3
-            notes.append(f"Gap up {gap_pct:.1f}%")
+        # D3: MACD already crossed and diverging wide -> penalty
+        if gap > 0 and last > 0 and gap > 0.01 * last:
+            pts -= 2
+            notes.append("MACD already extended")
 
-    # ── NEW: Volume-surge detection ──
-    if len(volume) >= 21:
-        avg_vol = float(volume.tail(20).iloc[:-1].mean())  # 20-day avg excl today
-        today_vol = float(volume.iloc[-1])
-        if avg_vol > 0 and today_vol > 2 * avg_vol:
-            price_up = float(close.iloc[-1]) > float(close.iloc[-2]) if len(close) >= 2 else False
-            if price_up:
-                ratio = today_vol / avg_vol
+    # ================================================================
+    # E) NEAR KEY SUPPORT/RESISTANCE LEVEL
+    # ================================================================
+
+    # E1: Price within 1% above 50-day MA (just reclaimed support)
+    if len(close) >= 50:
+        ma50 = float(close.rolling(50).mean().iloc[-1])
+        if ma50 > 0 and last >= ma50:
+            above_pct = (last - ma50) / ma50
+            if above_pct <= 0.01:
+                pts += 3
+                notes.append(f"Just reclaimed MA50 ({ma50:.2f})")
+
+    # E2: Price within 1% above 20-day MA (just reclaimed)
+    if len(close) >= 20:
+        ma20 = float(close.rolling(20).mean().iloc[-1])
+        if ma20 > 0 and last >= ma20:
+            above_pct = (last - ma20) / ma20
+            if above_pct <= 0.01:
                 pts += 2
-                notes.append(f"Vol surge {ratio:.1f}x")
+                notes.append(f"Just reclaimed MA20 ({ma20:.2f})")
+
+    # ================================================================
+    # REMOVED: gap detection, change_pct bonus, vol surge on same day
+    # ================================================================
 
     return min(pts, TECH_CAP), notes
 
 
 def score_fundamentals(info: dict) -> Tuple[float, List[str]]:
-    """Fundamental quality + value scoring.  Cap = 25."""
+    """Fundamental quality + value scoring.  Cap = 25.  100% IDENTICAL."""
     pts = 0.0
     notes: List[str] = []
 
@@ -652,7 +786,7 @@ def score_fundamentals(info: dict) -> Tuple[float, List[str]]:
 
 
 def score_options(info: dict) -> Tuple[float, List[str]]:
-    """Options-implied signals.  Cap = 20."""
+    """Options-implied signals.  Cap = 20.  UNCHANGED."""
     pts = 0.0
     notes: List[str] = []
 
@@ -709,13 +843,18 @@ def score_options(info: dict) -> Tuple[float, List[str]]:
     return min(pts, OPT_CAP), notes
 
 
-def score_catalyst(info: dict) -> Tuple[float, List[str]]:
-    """Catalyst / event scoring.  Cap = 25."""
+def score_catalyst(info: dict, rsi: Optional[float] = None) -> Tuple[float, List[str]]:
+    """
+    PREDICTIVE Catalyst / event scoring.  Cap = 25.
+    Focus on UPCOMING catalysts + conditional short squeeze setup.
+    """
     pts = 0.0
     notes: List[str] = []
 
-    # Earnings proximity
-    earn_date = info.get("earningsDate")
+    # ================================================================
+    # A) EARNINGS UPCOMING (next 1-7 days)
+    # ================================================================
+    earn_date = info.get("earningsDate") or info.get("earningsTimestamp")
     if earn_date:
         if isinstance(earn_date, list):
             earn_date = earn_date[0] if earn_date else None
@@ -726,16 +865,35 @@ def score_catalyst(info: dict) -> Tuple[float, List[str]]:
                 else:
                     ed = pd.Timestamp(earn_date)
                 days_to = (ed - pd.Timestamp.now()).days
-                if 0 < days_to <= 14:
-                    pts += 5
+                if 1 <= days_to <= 7:
+                    pts += 8
                     notes.append(f"Earnings in {days_to}d")
-                elif 0 < days_to <= 30:
-                    pts += 3
+                elif 0 < days_to <= 14:
+                    pts += 4
                     notes.append(f"Earnings in {days_to}d")
+                # > 7 days away or unknown: 0 pts
             except Exception:
                 pass
 
-    # Analyst recommendation
+    # ================================================================
+    # B) SHORT SQUEEZE SETUP (conditional on RSI)
+    # ================================================================
+    short_pct = info.get("shortPercentOfFloat") or 0
+    rsi_val = rsi if rsi is not None else 50.0  # default neutral if unknown
+
+    if short_pct > 0.25 and 40 <= rsi_val <= 65:
+        pts += 6
+        notes.append(f"Short squeeze setup {short_pct:.0%} short float")
+    elif short_pct > 0.15 and 40 <= rsi_val <= 65:
+        pts += 3
+        notes.append(f"Elevated short interest {short_pct:.0%}")
+    elif short_pct > 0.20 and rsi_val > 70:
+        # Squeeze already happened — no points
+        notes.append(f"Short {short_pct:.0%} but RSI {rsi_val:.0f} - squeeze done")
+
+    # ================================================================
+    # Analyst recommendation (kept)
+    # ================================================================
     rec = info.get("recommendationMean")
     if rec:
         if rec <= 2.0:
@@ -745,7 +903,9 @@ def score_catalyst(info: dict) -> Tuple[float, List[str]]:
             pts += 2
             notes.append(f"Analyst buy ({rec:.1f})")
 
-    # Target price upside
+    # ================================================================
+    # Target price upside (kept)
+    # ================================================================
     target = info.get("targetMeanPrice")
     price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
     if target and price and price > 0:
@@ -756,26 +916,22 @@ def score_catalyst(info: dict) -> Tuple[float, List[str]]:
         elif upside > 0.10:
             pts += 2
 
-    # Insider buying
+    # ================================================================
+    # Insider buying (kept)
+    # ================================================================
     insider = info.get("heldPercentInsiders")
     if insider and insider > 0.10:
         pts += 2
         notes.append(f"Insider own {insider:.1%}")
 
-    # ── NEW: Short-squeeze signal ──
-    short_pct = info.get("shortPercentOfFloat") or 0
-    if short_pct > 0.20:
-        pts += 5
-        notes.append(f"High short float {short_pct:.0%} – squeeze risk")
-    elif short_pct > 0.10:
-        pts += 2
-        notes.append(f"Elevated short float {short_pct:.0%}")
-
     return min(pts, CAT_CAP), notes
 
 
 def score_news(symbol: str) -> Tuple[float, List[str]]:
-    """Simple headline-sentiment scoring via yfinance news.  Cap = 15."""
+    """
+    PREDICTIVE headline-sentiment scoring via yfinance news.  Cap = 15.
+    Updated keyword lists; bonus for fresh (today's) news.
+    """
     pts = 0.0
     notes: List[str] = []
     try:
@@ -784,14 +940,28 @@ def score_news(symbol: str) -> Tuple[float, List[str]]:
         if not news:
             return 0, ["No recent news"]
         pos = neg = 0
+        has_today_news = False
+        today_str = dt.date.today().isoformat()
+
         for item in news[:10]:
             title = (item.get("title") or "").lower()
+            # Check if news is from today
+            pub_date = item.get("providerPublishTime")
+            if pub_date:
+                try:
+                    pub_dt = dt.datetime.fromtimestamp(pub_date)
+                    if pub_dt.date() == dt.date.today():
+                        has_today_news = True
+                except Exception:
+                    pass
+
             for w in _POS_WORDS:
                 if w in title:
                     pos += 1
             for w in _NEG_WORDS:
                 if w in title:
                     neg += 1
+
         net = pos - neg
         if net >= 3:
             pts += 6
@@ -807,6 +977,12 @@ def score_news(symbol: str) -> Tuple[float, List[str]]:
             notes.append(f"News negative ({pos}+/{neg}-)")
         else:
             notes.append(f"News neutral ({pos}+/{neg}-)")
+
+        # Bonus: fresh news from today (catalyst not yet priced in)
+        if has_today_news and pts > 0:
+            pts = pts * 1.5
+            notes.append("Fresh catalyst today")
+
     except Exception:
         notes.append("News fetch failed")
     return min(max(pts, -NEWS_CAP), NEWS_CAP), notes
@@ -817,7 +993,7 @@ def score_news(symbol: str) -> Tuple[float, List[str]]:
 # =====================================================================
 
 def analyse_ticker(symbol: str) -> TickerResult:
-    """Full multi-factor analysis on a single ticker."""
+    """Full multi-factor PREDICTIVE analysis on a single ticker."""
     res = TickerResult(symbol=symbol)
     try:
         t = yf.Ticker(symbol)
@@ -836,14 +1012,49 @@ def analyse_ticker(symbol: str) -> TickerResult:
         res.market_cap = float(info.get("marketCap") or 0)
         res.sector = info.get("sector") or ""
 
-        # scores
+        # Technical score (also extract RSI for catalyst use)
         res.technical_score, tn = score_technical(hist, info)
         res.notes.extend(tn)
+
+        # Extract RSI from notes for catalyst scoring
+        rsi_for_catalyst = None
+        for n in tn:
+            if "RSI" in n:
+                try:
+                    # Parse RSI value from note strings like "RSI primed 52 (room to run)"
+                    parts = n.split()
+                    for i, p in enumerate(parts):
+                        if p == "RSI":
+                            # next word after "RSI" might be a keyword, look for number
+                            for candidate in parts[i+1:]:
+                                candidate_clean = candidate.strip("()")
+                                try:
+                                    rsi_for_catalyst = float(candidate_clean)
+                                    break
+                                except ValueError:
+                                    continue
+                            break
+                except Exception:
+                    pass
+                break
+
+        # Recalculate RSI directly if not parsed from notes
+        if rsi_for_catalyst is None and len(hist) >= 15:
+            close = hist["Close"]
+            delta = close.diff()
+            gain = delta.clip(lower=0).rolling(14).mean()
+            loss_s = (-delta.clip(upper=0)).rolling(14).mean()
+            if float(loss_s.iloc[-1]) != 0:
+                rs = float(gain.iloc[-1]) / float(loss_s.iloc[-1])
+                rsi_for_catalyst = 100 - 100 / (1 + rs)
+            else:
+                rsi_for_catalyst = 100.0
+
         res.fundamental_score, fn = score_fundamentals(info)
         res.notes.extend(fn)
         res.options_score, on = score_options(info)
         res.notes.extend(on)
-        res.catalyst_score, cn = score_catalyst(info)
+        res.catalyst_score, cn = score_catalyst(info, rsi=rsi_for_catalyst)
         res.notes.extend(cn)
         res.news_score, nn = score_news(symbol)
         res.notes.extend(nn)
@@ -893,7 +1104,7 @@ def deep_dive(candidates: List[Tuple[str, float, float, int]],
 def print_report(results: List[TickerResult], regime: Dict[str, Any]):
     """Pretty-print ranked results to stdout."""
     print("\n" + "=" * 80)
-    print("  US MULTI-EXCHANGE STOCK SCREENER  ".center(80, "="))
+    print("  PREDICTIVE SCREENER - Next 1-2 Day Setups  ".center(80, "="))
     print("=" * 80)
     print(f"  Run: {dt.datetime.now():%Y-%m-%d %H:%M}   "
           f"Regime: {regime.get('trend', '?').upper()}   "
@@ -909,7 +1120,7 @@ def print_report(results: List[TickerResult], regime: Dict[str, Any]):
         print("\n  No valid results.\n")
         return
 
-    print(f"\n  TOP {min(30, len(ranked))} PICKS")
+    print(f"\n  TOP {min(30, len(ranked))} SETUPS (stocks coiling for next 1-2 day move)")
     print("-" * 80)
     fmt = "  {rank:>3}. {sym:<6} ${price:>8.2f} ({chg:>+6.1f}%)  "
     fmt += "T:{t:>4.0f} F:{f:>4.0f} O:{o:>4.0f} C:{c:>4.0f} N:{n:>4.0f} "
@@ -923,10 +1134,10 @@ def print_report(results: List[TickerResult], regime: Dict[str, Any]):
             total=r.total_score, sector=r.sector[:18],
         ))
         if r.notes:
-            # print top 5 notes
+            # print top 5 notes with predictive label
             top_notes = [n for n in r.notes if not n.startswith("News")][:5]
             if top_notes:
-                print(f"       └ {' | '.join(top_notes)}")
+                print(f"       └ WHY IT WILL MOVE: {' | '.join(top_notes)}")
 
     if errors:
         print(f"\n  ({len(errors)} tickers had errors)")
@@ -972,7 +1183,7 @@ def write_csv(results: List[TickerResult], path: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Full-Universe US Market Multi-Factor Stock Screener")
+        description="Full-Universe US Market PREDICTIVE Stock Screener — Next 1-2 Day Setups")
     parser.add_argument("--quick", action="store_true",
                         help=f"Fast mode: cap universe at {QUICK_UNIVERSE_CAP}")
     parser.add_argument("--csv", type=str, default="",
@@ -980,7 +1191,7 @@ def main():
     args = parser.parse_args()
 
     log.info("=" * 60)
-    log.info("US MULTI-EXCHANGE STOCK SCREENER starting")
+    log.info("PREDICTIVE SCREENER - Next 1-2 Day Setups")
     log.info("Exchanges: NYSE · NASDAQ · AMEX · ARCA · BATS")
     log.info("=" * 60)
 
@@ -997,7 +1208,7 @@ def main():
         tickers = tickers[:QUICK_UNIVERSE_CAP]
         log.info("--quick mode: capped to %d tickers", len(tickers))
 
-    # 3. Phase 1 — bulk filter
+    # 3. Phase 1 — bulk filter (PREDICTIVE: favours coiling stocks)
     survivors = phase1_bulk_filter(tickers, top_n=PHASE1_TOP_N)
 
     # 4. Phase 2 — deep dive
