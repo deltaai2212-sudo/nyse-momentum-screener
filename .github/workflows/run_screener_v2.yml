@@ -17,11 +17,11 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Install dependencies
         run: |
-          pip install yfinance pandas pandas_ta tqdm numpy
+          pip install yfinance pandas pandas-ta tqdm numpy
 
       - name: Run screener v2
         run: |
