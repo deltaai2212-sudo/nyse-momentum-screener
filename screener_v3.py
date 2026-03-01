@@ -38,27 +38,27 @@ class StockResult:
     score: float = 0.0
     price: float = 0.0
     signals: list = field(default_factory=list)
-    win_prob: float = 0.0 # Estimated probability based on backtest research
-    tp: float = 0.0 # Take Profit
-    sl: float = 0.0 # Stop Loss
+    win_prob: float = 0.0 
+    tp: float = 0.0 
+    sl: float = 0.0 
 
 def get_precision_data(ticker):
     try:
         tk = yf.Ticker(ticker)
-        # Fetch 5m intraday for VWAP calculation
-        hist_intraday = tk.history(period="1d", interval="5m")
-        # Fetch daily for setup analysis
+        # Use 1h for VWAP calculation over 5d to ensure data presence
+        hist_v = tk.history(period="5d", interval="1h")
+        # Daily for setup
         hist_daily = tk.history(period="60d")
-        if hist_daily.empty or hist_intraday.empty: return None
+        if hist_daily.empty or hist_v.empty: return None
         
         info = tk.info or {}
-        return {"ticker": ticker, "daily": hist_daily, "intraday": hist_intraday, "info": info}
+        return {"ticker": ticker, "daily": hist_daily, "v_hist": hist_v, "info": info}
     except: return None
 
 def score_v3(data):
     ticker = data['ticker']
     daily = data['daily']
-    intraday = data['intraday']
+    v_hist = data['v_hist']
     info = data['info']
     
     price = daily['Close'].iloc[-1]
@@ -68,40 +68,44 @@ def score_v3(data):
     score = 0.0
     
     # 1. VWAP RECLAIM (Filter)
-    # Approx VWAP: sum(P*V)/sum(V)
-    intraday['tpv'] = (intraday['High'] + intraday['Low'] + intraday['Close']) / 3 * intraday['Volume']
-    vwap = intraday['tpv'].sum() / intraday['Volume'].sum()
+    # Using typical price * volume for simple vwap
+    v_hist['tpv'] = (v_hist['High'] + v_hist['Low'] + v_hist['Close']) / 3 * v_hist['Volume']
+    vwap = v_hist['tpv'].sum() / v_hist['Volume'].sum()
     if price > vwap:
         score += 20
         signals.append("ABOVE_VWAP")
     
-    # 2. SHORT SQUEEZE PRECISION (DTC > 5 or Short% > 20%)
-    short_pct = info.get('shortPercentOfFloat', 0) * 100
+    # 2. SHORT SQUEEZE PRECISION
+    short_pct = info.get('shortPercentOfFloat', 0)
+    if short_pct < 1: short_pct *= 100
     dtc = info.get('shortRatio', 0)
     if short_pct > 20 or dtc > 5:
         score += 25
-        signals.append(f"SQUEEZE_RISK_{short_pct:.0f}%")
+        signals.append(f"SQUEEZE_{short_pct:.0f}%")
         
-    # 3. EARNINGS MOMENTUM (Gaps > 5% on volume)
+    # 3. EARNINGS MOMENTUM / GAPS
     gap = (daily['Open'].iloc[-1] / daily['Close'].iloc[-2] - 1) * 100
     if gap > 5 and vol_ratio > 1.5:
         score += 30
-        signals.append(f"EARNINGS_GAP_{gap:.1f}%")
+        signals.append(f"GAP_{gap:.1f}%")
         
-    # 4. INSTITUTIONAL VOLUME (RV > 2.0)
+    # 4. INSTITUTIONAL VOLUME
     if vol_ratio > 2.0:
         score += 25
-        signals.append("INST_VOL_CONFIRMED")
+        signals.append("INST_VOL")
         
-    # Win Probability Estimate (Heuristic based on research)
-    # Research says gap ups have 68% continuation. VWAP + Gap + Vol is the "golden" setup.
+    # Win Probability Estimate
     base_prob = 50
     if "ABOVE_VWAP" in signals: base_prob += 10
     if any("GAP" in s for s in signals): base_prob += 10
-    if "INST_VOL_CONFIRMED" in signals: base_prob += 5
+    if "INST_VOL" in signals: base_prob += 5
     
-    # ATR for TP/SL
-    atr = ta.atr(daily['High'], daily['Low'], daily['Close'], length=14).iloc[-1]
+    # ATR for TP/SL (14-period)
+    hi = daily['High'].tail(20)
+    lo = daily['Low'].tail(20)
+    cl = daily['Close'].tail(20)
+    tr = pd.concat([hi-lo, (hi-cl.shift(1)).abs(), (lo-cl.shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.tail(14).mean()
     
     return StockResult(
         ticker=ticker,
@@ -109,7 +113,7 @@ def score_v3(data):
         price=price,
         signals=signals,
         win_prob=base_prob,
-        tp=round(price + (atr * 2), 2),
+        tp=round(price + (atr * 2.0), 2),
         sl=round(price - (atr * 1.5), 2)
     )
 
@@ -122,13 +126,14 @@ def main():
             data = f.result()
             if data:
                 res = score_v3(data)
-                if res.score >= 50: results.append(res)
+                if res.score >= 40: results.append(res)
     
     results.sort(key=lambda x: x.win_prob, reverse=True)
     print("
 TOP HIGH-CONVICTION SETUPS:")
     for r in results[:10]:
-        print(f"{r.ticker} | Prob: {r.win_prob}% | Price: ${r.price:.2f} | TP: ${r.tp} | SL: ${r.sl} | {', '.join(r.signals)}")
+        sig_str = ", ".join(r.signals)
+        print(f"{r.ticker:5} | Prob: {r.win_prob}% | Price: ${r.price:7.2f} | TP: ${r.tp:7.2f} | SL: ${r.sl:7.2f} | {sig_str}")
 
 if __name__ == "__main__":
     main()
