@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 import yfinance as yf
 from tqdm import tqdm
 
@@ -45,14 +44,14 @@ class StockResult:
 def get_precision_data(ticker):
     try:
         tk = yf.Ticker(ticker)
-        # Use 1h for VWAP calculation over 5d to ensure data presence
-        hist_v = tk.history(period="5d", interval="1h")
+        # Use 1h for VWAP calculation
+        v_hist = tk.history(period="5d", interval="1h")
         # Daily for setup
-        hist_daily = tk.history(period="60d")
-        if hist_daily.empty or hist_v.empty: return None
+        h_daily = tk.history(period="60d")
+        if h_daily.empty or v_hist.empty: return None
         
         info = tk.info or {}
-        return {"ticker": ticker, "daily": hist_daily, "v_hist": hist_v, "info": info}
+        return {"ticker": ticker, "daily": h_daily, "v_hist": v_hist, "info": info}
     except: return None
 
 def score_v3(data):
@@ -67,15 +66,14 @@ def score_v3(data):
     signals = []
     score = 0.0
     
-    # 1. VWAP RECLAIM (Filter)
-    # Using typical price * volume for simple vwap
+    # 1. VWAP RECLAIM
     v_hist['tpv'] = (v_hist['High'] + v_hist['Low'] + v_hist['Close']) / 3 * v_hist['Volume']
     vwap = v_hist['tpv'].sum() / v_hist['Volume'].sum()
     if price > vwap:
         score += 20
         signals.append("ABOVE_VWAP")
     
-    # 2. SHORT SQUEEZE PRECISION
+    # 2. SHORT SQUEEZE
     short_pct = info.get('shortPercentOfFloat', 0)
     if short_pct < 1: short_pct *= 100
     dtc = info.get('shortRatio', 0)
@@ -83,7 +81,7 @@ def score_v3(data):
         score += 25
         signals.append(f"SQUEEZE_{short_pct:.0f}%")
         
-    # 3. EARNINGS MOMENTUM / GAPS
+    # 3. EARNINGS MOMENTUM
     gap = (daily['Open'].iloc[-1] / daily['Close'].iloc[-2] - 1) * 100
     if gap > 5 and vol_ratio > 1.5:
         score += 30
@@ -94,13 +92,13 @@ def score_v3(data):
         score += 25
         signals.append("INST_VOL")
         
-    # Win Probability Estimate
+    # Win Probability
     base_prob = 50
     if "ABOVE_VWAP" in signals: base_prob += 10
     if any("GAP" in s for s in signals): base_prob += 10
     if "INST_VOL" in signals: base_prob += 5
     
-    # ATR for TP/SL (14-period)
+    # Manual ATR
     hi = daily['High'].tail(20)
     lo = daily['Low'].tail(20)
     cl = daily['Close'].tail(20)
