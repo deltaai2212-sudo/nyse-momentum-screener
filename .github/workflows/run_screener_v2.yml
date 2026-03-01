@@ -1,4 +1,4 @@
-name: Explosive Mover Screener V2
+name: High-Precision Screener V3
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     - cron: '0 14 * * 1-5'
 
 jobs:
-  run-screener-v2:
+  run-screener-v3:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -23,14 +23,5 @@ jobs:
         run: |
           pip install yfinance pandas pandas-ta tqdm numpy
 
-      - name: Run screener v2
-        run: |
-          python screener_v2.py
-
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: screener-v2-results
-          path: screener_v2_results.csv
-          retention-days: 7
+      - name: Run screener v3
+        run: python screener_v3.py
